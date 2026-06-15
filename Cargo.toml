@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/naboscale-crypto",
+    "crates/naboscale-proto",
+    "crates/naboscale-tunnel",
+    "crates/naboscale-coord",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["adria"]
+
+[workspace.dependencies]
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+blake2 = "0.10"
+rand_core = { version = "0.6", features = ["std"] }
+rand = "0.8"
+thiserror = "1"
+snow = { version = "0.9", default-features = false, features = ["default-resolver"] }
+subtle = "2"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+hex = "0.4"
+naboscale-crypto = { path = "crates/naboscale-crypto" }
+tun = "0.7"
+bytes = "1"
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

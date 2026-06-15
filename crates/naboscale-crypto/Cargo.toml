@@ -1,0 +1,25 @@
+[package]
+name = "naboscale-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Noise IKpsk2 + WireGuard-style handshake and transport crypto for naboscale"
+
+[dependencies]
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+blake2 = { workspace = true }
+rand_core = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+snow = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+base64 = "0.22"
+
+[dev-dependencies]
+hex = { workspace = true }

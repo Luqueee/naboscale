@@ -1,0 +1,17 @@
+[package]
+name = "naboscale-tunnel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "TUN device + UDP transport for the naboscale mesh VPN"
+
+[dependencies]
+naboscale-crypto = { workspace = true }
+tun = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+naboscale-crypto = { workspace = true }
