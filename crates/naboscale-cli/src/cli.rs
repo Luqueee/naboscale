@@ -35,11 +35,17 @@ pub enum Commands {
     Register,
     Peers,
     Status,
+    Heartbeat {
+        #[arg(long)]
+        endpoint: String,
+    },
     Up {
         #[arg(long, default_value = "utun99")]
         tun: String,
         #[arg(long, default_value_t = 0)]
         peer_index: usize,
+        #[arg(long, default_value_t = 51820)]
+        bind_port: u16,
     },
     Down,
 }
@@ -51,7 +57,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Register => cmd_register(&dir).await,
         Commands::Peers => cmd_peers(&dir).await,
         Commands::Status => cmd_status(&dir),
-        Commands::Up { tun, peer_index } => cmd_up(&dir, &tun, peer_index).await,
+        Commands::Heartbeat { endpoint } => cmd_heartbeat(&dir, &endpoint).await,
+        Commands::Up { tun, peer_index, bind_port } => cmd_up(&dir, &tun, peer_index, bind_port).await,
         Commands::Down => cmd_down(&dir),
     }
 }
@@ -160,6 +167,19 @@ fn cmd_status(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_heartbeat(dir: &Path, endpoint: &str) -> Result<()> {
+    let identity = identity::load_identity(dir)?;
+    let cfg = Config::load(dir)?;
+    let mut state = State::load(dir)?;
+    let client = CoordClient::new(&cfg.server.url);
+    client.heartbeat(&identity, &state.auth_token, endpoint).await?;
+    state.last_endpoint = Some(endpoint.to_string());
+    state.last_handshake_at = Some(chrono::Utc::now().timestamp());
+    state.save(dir)?;
+    println!("heartbeat sent: {}", endpoint);
+    Ok(())
+}
+
 fn cmd_down(_dir: &Path) -> Result<()> {
     let _ = identity::ensure_config_dir()?;
     let pid_path = identity::ensure_config_dir()?.join(identity::DAEMON_PID_FILE);
@@ -178,7 +198,7 @@ fn cmd_down(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(dir: &Path, tun_name: &str, peer_index: usize) -> Result<()> {
+async fn cmd_up(dir: &Path, tun_name: &str, peer_index: usize, bind_port: u16) -> Result<()> {
     let identity = identity::load_identity(dir)?;
     let wg = identity::load_wg_key(dir)?;
     let cfg = Config::load(dir)?;
@@ -215,20 +235,29 @@ async fn cmd_up(dir: &Path, tun_name: &str, peer_index: usize) -> Result<()> {
     platform::configure_tun(&actual_tun_name, &my_ip, &peer_ip)?;
     platform::add_route("100.100.0.0/16", &actual_tun_name)?;
 
-    let bind_port = 51820;
     let transport = UdpTransport::bind(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), bind_port),
         peer_endpoint,
     )?;
     let local_endpoint = transport.local_addr()?.to_string();
 
+    let is_initiator = *wg.public() > peer_pub;
     let mgr_cfg = ManagerConfig {
         local_keypair: wg,
         peer_pub,
         psk: [0u8; 32],
         local_sender_id: 1,
-        is_initiator: true,
+        is_initiator,
     };
+    println!(
+        "naboscale up: role={} tun={} my_ip={} peer_ip={} via {}",
+        if is_initiator { "initiator" } else { "responder" },
+        actual_tun_name,
+        my_ip,
+        peer_ip,
+        peer_endpoint
+    );
+    println!("Local endpoint: {}", local_endpoint);
     let mut manager = TunnelManager::new(Box::new(device), transport, mgr_cfg)?;
 
     let _ = client
@@ -238,8 +267,6 @@ async fn cmd_up(dir: &Path, tun_name: &str, peer_index: usize) -> Result<()> {
     state.last_handshake_at = Some(Tai64N::now().seconds() as i64);
     state.save(dir)?;
 
-    println!("naboscale up: tun={} my_ip={} peer_ip={} via {}", actual_tun_name, my_ip, peer_ip, peer_endpoint);
-    println!("Local endpoint: {}", local_endpoint);
     println!("Press Ctrl+C to stop.");
 
     let stop = tokio::signal::ctrl_c();
@@ -276,8 +303,7 @@ async fn cmd_up(dir: &Path, tun_name: &str, peer_index: usize) -> Result<()> {
             }
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if let Err(e) = manager.step() {
-                    tracing::error!(?e, "manager step failed");
-                    return Err(crate::Error::Tunnel(e));
+                    tracing::warn!(?e, "manager step failed (will retry)");
                 }
             }
         }

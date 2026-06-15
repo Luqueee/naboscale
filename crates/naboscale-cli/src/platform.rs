@@ -48,7 +48,7 @@ pub fn configure_tun(name: &str, local_ip: &str, peer_ip: &str) -> Result<()> {
 
 pub fn add_route_macos(dest: &str, tun_name: &str) -> Result<()> {
     let status = Command::new("route")
-        .args(["add", "-net", dest, "-interface", tun_name])
+        .args(["-n", "add", "-net", dest, "-interface", tun_name])
         .status()?;
     if !status.success() {
         return Err(Error::Server(format!(
@@ -61,11 +61,11 @@ pub fn add_route_macos(dest: &str, tun_name: &str) -> Result<()> {
 
 pub fn add_route_linux(dest: &str, tun_name: &str) -> Result<()> {
     let status = Command::new("ip")
-        .args(["route", "add", dest, "dev", tun_name])
+        .args(["route", "replace", dest, "dev", tun_name])
         .status()?;
     if !status.success() {
         return Err(Error::Server(format!(
-            "ip route add {} dev {} failed",
+            "ip route replace {} dev {} failed",
             dest, tun_name
         )));
     }

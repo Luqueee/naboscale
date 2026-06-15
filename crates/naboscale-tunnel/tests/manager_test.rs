@@ -61,14 +61,9 @@ fn two_nodes_complete_handshake_and_tunnel_a_packet() {
 
     let port_a = free_port();
     let port_b = free_port();
-    let (alice, alice_user) = make_node(
-        true,
-        1,
-        alice_kp.clone(),
-        *bob_kp.public(),
-        port_a,
-        port_b,
-    );
+    // Create bob (responder) FIRST so his UDP socket is bound when alice's init
+    // is sent in the next call. Otherwise the init lands on an unbound port and
+    // is dropped, and the handshake never completes.
     let (bob, bob_user) = make_node(
         false,
         2,
@@ -76,6 +71,14 @@ fn two_nodes_complete_handshake_and_tunnel_a_packet() {
         *alice_kp.public(),
         port_b,
         port_a,
+    );
+    let (alice, alice_user) = make_node(
+        true,
+        1,
+        alice_kp.clone(),
+        *bob_kp.public(),
+        port_a,
+        port_b,
     );
 
     let (alice_ready_tx, alice_ready_rx) = mpsc::channel();
