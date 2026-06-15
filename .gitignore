@@ -1,4 +1,43 @@
+# Rust build artifacts
 /target
+**/target/
 **/*.rs.bk
 Cargo.lock.bak
+
+# Secrets & local state — NEVER commit
+# Private keys (curve25519, ed25519) used by nodes
+**/*.key
+# Test-generated public keys (real prod keys go elsewhere)
+**/*.pub
+# Per-node state from `naboscale init` and `naboscale up`
+**/state.json
+**/state.json.bak
+# Coord server database (contains registered public keys + IPs)
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS / editor cruft
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.log
+
+# Build / run artifacts
+*.pid
+*.sock
+core
+core.*
+
+# opencode / agent runtime (per-project state, not project source)
+.agents/
+skills-lock.json
+.opencode/
