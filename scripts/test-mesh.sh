@@ -119,7 +119,7 @@ step "starting $NODE_COUNT nodes (staggered by ${WAIT_BETWEEN}s)"
 for i in $(seq 0 $((NODE_COUNT-1))); do
     log="$LOG_DIR/node$((i+1)).log"
     nohup "$NAB" --config-dir "${NODES[$i]}" up \
-        --tun "${TUNS[$i]}" --bind-port "${PORTS[$i]}" --peer-index 0 \
+        --tun "${TUNS[$i]}" --bind-port "${PORTS[$i]}" \
         > "$log" 2>&1 &
     pid=$!
     PIDS[$i]=$pid

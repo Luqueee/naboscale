@@ -8,6 +8,7 @@
 #   errors      CLI error paths and security (bad sig, missing token)
 #   persistence coord DB survives restart
 #   mesh        end-to-end mesh VPN (2 nodes, pings)
+#   mesh3       end-to-end mesh VPN (3 nodes, pings A↔B, A↔C, B↔C)
 #   all         (default) run everything in order
 set -uo pipefail
 
@@ -39,17 +40,19 @@ record_skip() { SKIP=$((SKIP+1)); RESULTS+=("SKIP|$*"); }
 run_nab() { "$NAB" "$@"; }
 
 cleanup_nodes() {
-    for cfg in "$WORK"/node* "$WORK"/mesh* "$WORK"/errtest "$WORK"/persist "$WORK"/meshA "$WORK"/meshB; do
+    for cfg in "$WORK"/node* "$WORK"/mesh* "$WORK"/mesh3* "$WORK"/errtest "$WORK"/persist "$WORK"/meshA "$WORK"/meshB; do
         [ -d "$cfg" ] || continue
         pkill -f "naboscale --config-dir $cfg" 2>/dev/null || true
     done
     sleep 0.5
-    for cfg in "$WORK"/node* "$WORK"/mesh* "$WORK"/errtest "$WORK"/persist "$WORK"/meshA "$WORK"/meshB; do
+    for cfg in "$WORK"/node* "$WORK"/mesh* "$WORK"/mesh3* "$WORK"/errtest "$WORK"/persist "$WORK"/meshA "$WORK"/meshB; do
         [ -d "$cfg" ] || continue
         pkill -9 -f "naboscale --config-dir $cfg" 2>/dev/null || true
     done
     for i in 0 1 2 3 4 5 6 7 8 9; do
         ip link delete "utun9$i" 2>/dev/null || true
+        ip link delete "utun8$i" 2>/dev/null || true
+        ip link delete "utun7$i" 2>/dev/null || true
     done
 }
 
@@ -289,7 +292,7 @@ test_persistence() {
 }
 
 # ============================================================================
-# 6. Mesh VPN end-to-end
+# 6. Mesh VPN end-to-end (2 nodes)
 # ============================================================================
 test_mesh() {
     hdr "6. Mesh VPN end-to-end (2 nodes, pings)"
@@ -313,74 +316,138 @@ test_mesh() {
     ip_a=$(run_nab --config-dir "$cfg_a" status 2>&1 | awk '/^ip:/{print $2}')
     ip_b=$(run_nab --config-dir "$cfg_b" status 2>&1 | awk '/^ip:/{print $2}')
 
-    # role is auto-determined by pubkey comparison; smaller pubkey = responder.
-    # We need to start the responder FIRST, then the initiator.
-    local responder_cfg initiator_cfg responder_tun initiator_tun responder_port initiator_port responder_ip initiator_ip
-    local a_pub b_pub
-    a_pub=$(run_nab --config-dir "$cfg_a" status 2>&1 | awk '/^last hs/{print $4}' 2>/dev/null || true)
-    # easier: peek at the wg pub via a known path. we'll just try one order first,
-    # and if it fails, swap. simpler: just start both with a small delay so the
-    # listener is bound before the initiator sends.
-    responder_cfg=$cfg_a; initiator_cfg=$cfg_b
-    responder_tun=utun99; initiator_tun=utun98
-    responder_port=51820; initiator_port=51821
-    responder_ip=$ip_a; initiator_ip=$ip_b
-
-    info "starting responder (auto-detected by pubkey) on $responder_tun:$responder_port (ip=$responder_ip)"
-    local log_r="$LOG_DIR/meshR.log"
-    nohup "$NAB" --config-dir "$responder_cfg" up --tun "$responder_tun" --bind-port "$responder_port" --peer-index 0 > "$log_r" 2>&1 &
-    local pid_r=$!
-    # wait for the responder to bind
+    info "starting A on utun99:51820 (ip=$ip_a)"
+    local log_a="$LOG_DIR/meshA.log"
+    nohup "$NAB" --config-dir "$cfg_a" up --tun "utun99" --bind-port 51820 > "$log_a" 2>&1 &
+    local pid_a=$!
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        grep -q "role=responder" "$log_r" 2>/dev/null && break
+        grep -q "Local endpoint" "$log_a" 2>/dev/null && break
         sleep 0.3
     done
-    sleep 1
+    sleep 0.5
 
-    info "starting initiator on $initiator_tun:$initiator_port (ip=$initiator_ip)"
-    local log_i="$LOG_DIR/meshI.log"
-    nohup "$NAB" --config-dir "$initiator_cfg" up --tun "$initiator_tun" --bind-port "$initiator_port" --peer-index 0 > "$log_i" 2>&1 &
-    local pid_i=$!
-    # wait for the initiator to bind
+    info "starting B on utun98:51821 (ip=$ip_b)"
+    local log_b="$LOG_DIR/meshB.log"
+    nohup "$NAB" --config-dir "$cfg_b" up --tun "utun98" --bind-port 51821 > "$log_b" 2>&1 &
+    local pid_b=$!
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        grep -q "role=initiator" "$log_i" 2>/dev/null && break
+        grep -q "Local endpoint" "$log_b" 2>/dev/null && break
         sleep 0.3
     done
 
-    info "waiting 6s for handshakes (init auto-retries every 500ms)"
+    info "waiting 6s for handshake (init auto-retries every 500ms)"
     sleep 6
 
-    info "ping $responder_ip -> $initiator_ip"
-    if ping -c 2 -W 2 -I "$responder_ip" "$initiator_ip" 2>&1 | grep -q "0% packet loss"; then
-        ok "responder → initiator pings through tunnel"
-        record_pass "mesh ping responder->initiator"
+    info "ping $ip_a -> $ip_b"
+    if ping -c 2 -W 2 -I "$ip_a" "$ip_b" 2>&1 | grep -q "0% packet loss"; then
+        ok "A → B pings through tunnel"
+        record_pass "mesh ping A->B"
     else
-        fail "responder → initiator ping failed"
-        record_fail "mesh ping responder->initiator"
+        fail "A → B ping failed"
+        record_fail "mesh ping A->B"
     fi
 
-    info "ping $initiator_ip -> $responder_ip"
-    if ping -c 2 -W 2 -I "$initiator_ip" "$responder_ip" 2>&1 | grep -q "0% packet loss"; then
-        ok "initiator → responder pings through tunnel"
-        record_pass "mesh ping initiator->responder"
+    info "ping $ip_b -> $ip_a"
+    if ping -c 2 -W 2 -I "$ip_b" "$ip_a" 2>&1 | grep -q "0% packet loss"; then
+        ok "B → A pings through tunnel"
+        record_pass "mesh ping B->A"
     else
-        fail "initiator → responder ping failed"
-        record_fail "mesh ping initiator->responder"
+        fail "B → A ping failed"
+        record_fail "mesh ping B->A"
     fi
+
+    info "killing node processes"
+    kill "$pid_a" "$pid_b" 2>/dev/null || true
+    sleep 1
+    kill -9 "$pid_a" "$pid_b" 2>/dev/null || true
+    ip link delete "utun99" 2>/dev/null || true
+    ip link delete "utun98" 2>/dev/null || true
+}
+
+# ============================================================================
+# 7. Mesh VPN end-to-end (3 nodes, full mesh)
+# ============================================================================
+test_mesh3() {
+    hdr "7. Mesh VPN end-to-end (3 nodes, full mesh, pings)"
+    cleanup_nodes
+    if ! restart_coord_clean; then
+        fail "coord server not ready for mesh3 test"
+        record_fail "mesh3 setup"
+        return
+    fi
+
+    local cfg_a="$WORK/mesh3A" cfg_b="$WORK/mesh3B" cfg_c="$WORK/mesh3C"
+    rm -rf "$cfg_a" "$cfg_b" "$cfg_c"
+    run_nab --config-dir "$cfg_a" init --server "$SERVER" --force >/dev/null
+    run_nab --config-dir "$cfg_b" init --server "$SERVER" --force >/dev/null
+    run_nab --config-dir "$cfg_c" init --server "$SERVER" --force >/dev/null
+    run_nab --config-dir "$cfg_a" register >/dev/null
+    run_nab --config-dir "$cfg_b" register >/dev/null
+    run_nab --config-dir "$cfg_c" register >/dev/null
+    run_nab --config-dir "$cfg_a" heartbeat --endpoint "127.0.0.1:51820" >/dev/null
+    run_nab --config-dir "$cfg_b" heartbeat --endpoint "127.0.0.1:51821" >/dev/null
+    run_nab --config-dir "$cfg_c" heartbeat --endpoint "127.0.0.1:51822" >/dev/null
+
+    local ip_a ip_b ip_c
+    ip_a=$(run_nab --config-dir "$cfg_a" status 2>&1 | awk '/^ip:/{print $2}')
+    ip_b=$(run_nab --config-dir "$cfg_b" status 2>&1 | awk '/^ip:/{print $2}')
+    ip_c=$(run_nab --config-dir "$cfg_c" status 2>&1 | awk '/^ip:/{print $2}')
+
+    info "starting 3 nodes (A on utun99:51820, B on utun98:51821, C on utun97:51822)"
+    local log_a="$LOG_DIR/mesh3A.log" log_b="$LOG_DIR/mesh3B.log" log_c="$LOG_DIR/mesh3C.log"
+    nohup "$NAB" --config-dir "$cfg_a" up --tun "utun99" --bind-port 51820 > "$log_a" 2>&1 &
+    local pid_a=$!
+    nohup "$NAB" --config-dir "$cfg_b" up --tun "utun98" --bind-port 51821 > "$log_b" 2>&1 &
+    local pid_b=$!
+    nohup "$NAB" --config-dir "$cfg_c" up --tun "utun97" --bind-port 51822 > "$log_c" 2>&1 &
+    local pid_c=$!
+
+    for log in "$log_a" "$log_b" "$log_c"; do
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            grep -q "Local endpoint" "$log" 2>/dev/null && break
+            sleep 0.3
+        done
+    done
+    sleep 0.5
+
+    info "waiting 8s for 6 handshakes (3 per node)"
+    sleep 8
+
+    local pids=("$pid_a" "$pid_b" "$pid_c")
+    local tuns=("utun99" "utun98" "utun97")
+    local labels=("A" "B" "C")
+
+    local n_ok=0
+    local n_total=6
+    for pair in "A $ip_a $ip_b" "B $ip_b $ip_c" "C $ip_a $ip_c"; do
+        local label=$(echo $pair | awk '{print $1}')
+        local src=$(echo $pair | awk '{print $2}')
+        local dst=$(echo $pair | awk '{print $3}')
+        info "ping $label: $src -> $dst"
+        if ping -c 2 -W 2 -I "$src" "$dst" 2>&1 | grep -q "0% packet loss"; then
+            ok "$label: $src → $dst works"
+            record_pass "mesh3 ping $src->$dst"
+            n_ok=$((n_ok+1))
+        else
+            fail "$label: $src → $dst failed"
+            record_fail "mesh3 ping $src->$dst"
+        fi
+    done
 
     info "TUN packet counters"
-    for tun in "$responder_tun" "$initiator_tun"; do
+    for tun in "${tuns[@]}"; do
         local rx=$(ip -s link show "$tun" 2>/dev/null | awk '/^    RX:/{getline; print $1}')
         local tx=$(ip -s link show "$tun" 2>/dev/null | awk '/^    TX:/{getline; print $1}')
         printf "    %-8s  rx=%-5s  tx=%s\n" "$tun" "${rx:-0}" "${tx:-0}"
     done
 
-    info "killing node processes"
-    kill "$pid_r" "$pid_i" 2>/dev/null || true
+    info "killing 3 node processes"
+    kill "${pids[@]}" 2>/dev/null || true
     sleep 1
-    kill -9 "$pid_r" "$pid_i" 2>/dev/null || true
-    ip link delete "$responder_tun" 2>/dev/null || true
-    ip link delete "$initiator_tun" 2>/dev/null || true
+    kill -9 "${pids[@]}" 2>/dev/null || true
+    for tun in "${tuns[@]}"; do
+        ip link delete "$tun" 2>/dev/null || true
+    done
 }
 
 # ============================================================================
@@ -395,6 +462,7 @@ case "$SECTION" in
     errors)      test_errors ;;
     persistence) test_persistence ;;
     mesh)        test_mesh ;;
+    mesh3)       test_mesh3 ;;
     all)
         test_unit
         test_coord
@@ -402,10 +470,11 @@ case "$SECTION" in
         test_errors
         test_persistence
         test_mesh
+        test_mesh3
         ;;
     *)
         echo "unknown section: $SECTION"
-        echo "usage: $0 [all|unit|coord|cli|errors|persistence|mesh]"
+        echo "usage: $0 [all|unit|coord|cli|errors|persistence|mesh|mesh3]"
         exit 2
         ;;
 esac

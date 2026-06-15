@@ -30,6 +30,8 @@ Cargo.lock.bak
 *.swo
 *~
 *.log
+._*
+**/._*
 
 # Build / run artifacts
 *.pid

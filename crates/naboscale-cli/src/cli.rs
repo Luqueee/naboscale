@@ -42,8 +42,6 @@ pub enum Commands {
     Up {
         #[arg(long, default_value = "utun99")]
         tun: String,
-        #[arg(long, default_value_t = 0)]
-        peer_index: usize,
         #[arg(long, default_value_t = 51820)]
         bind_port: u16,
     },
@@ -58,7 +56,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Peers => cmd_peers(&dir).await,
         Commands::Status => cmd_status(&dir),
         Commands::Heartbeat { endpoint } => cmd_heartbeat(&dir, &endpoint).await,
-        Commands::Up { tun, peer_index, bind_port } => cmd_up(&dir, &tun, peer_index, bind_port).await,
+        Commands::Up { tun, bind_port } => cmd_up(&dir, &tun, bind_port).await,
         Commands::Down => cmd_down(&dir),
     }
 }
@@ -198,67 +196,84 @@ fn cmd_down(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(dir: &Path, tun_name: &str, peer_index: usize, bind_port: u16) -> Result<()> {
+async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16) -> Result<()> {
     let identity = identity::load_identity(dir)?;
     let wg = identity::load_wg_key(dir)?;
     let cfg = Config::load(dir)?;
     let mut state = State::load(dir)?;
 
     let client = CoordClient::new(&cfg.server.url);
-    let mut peers = client.peers(&state.auth_token).await?;
+    let peers = client.peers(&state.auth_token).await?;
     if peers.is_empty() {
         return Err(Error::Server("no peers registered on coord server".into()));
     }
-    if peer_index >= peers.len() {
-        return Err(Error::Server(format!(
-            "peer_index {} out of bounds (have {} peers)",
-            peer_index,
-            peers.len()
-        )));
+
+    let mut peer_cfgs: Vec<naboscale_tunnel::PeerConfig> = Vec::with_capacity(peers.len());
+    for (i, peer) in peers.iter().enumerate() {
+        let peer_pub: [u8; 32] = B64
+            .decode(&peer.wg_pubkey)?
+            .try_into()
+            .map_err(|_| Error::Server("peer wg_pubkey is not 32 bytes".into()))?;
+        let peer_endpoint: SocketAddr = peer
+            .last_endpoint
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Server(format!(
+                    "peer {} has no last_endpoint; needs to send a heartbeat",
+                    peer.node_id
+                ))
+            })?
+            .parse()
+            .map_err(|_| Error::Server("peer endpoint is not a valid socket address".into()))?;
+        let peer_ip: Ipv4Addr = peer
+            .ip
+            .parse()
+            .map_err(|_| Error::Server(format!("peer ip is not a valid IPv4: {}", peer.ip)))?;
+        let is_initiator = *wg.public() > peer_pub;
+        peer_cfgs.push(naboscale_tunnel::PeerConfig {
+            peer_pub,
+            psk: [0u8; 32],
+            local_sender_id: (i as u32) + 1,
+            is_initiator,
+            peer_endpoint,
+            peer_ip,
+        });
     }
-    let peer = peers.remove(peer_index);
-    let peer_pub = B64
-        .decode(&peer.wg_pubkey)?
-        .try_into()
-        .map_err(|_| Error::Server("peer wg_pubkey is not 32 bytes".into()))?;
-    let peer_endpoint: SocketAddr = peer
-        .last_endpoint
-        .as_deref()
-        .ok_or_else(|| Error::Server(format!("peer {} has no last_endpoint; needs to send a heartbeat", peer.node_id)))?
-        .parse()
-        .map_err(|_| Error::Server("peer endpoint is not a valid socket address".into()))?;
 
     let device = TunDevice::create(tun_name)?;
     let actual_tun_name = device.name().to_string();
     let my_ip = state.ip.clone();
-    let peer_ip = peer.ip.clone();
-    platform::configure_tun(&actual_tun_name, &my_ip, &peer_ip)?;
+    let dummy_peer_ip = peer_cfgs[0].peer_ip.to_string();
+    platform::configure_tun(&actual_tun_name, &my_ip, &dummy_peer_ip)?;
     platform::add_route("100.100.0.0/16", &actual_tun_name)?;
 
-    let transport = UdpTransport::bind(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), bind_port),
-        peer_endpoint,
-    )?;
+    let transport = UdpTransport::bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        bind_port,
+    ))?;
     let local_endpoint = transport.local_addr()?.to_string();
 
-    let is_initiator = *wg.public() > peer_pub;
     let mgr_cfg = ManagerConfig {
         local_keypair: wg,
-        peer_pub,
-        psk: [0u8; 32],
-        local_sender_id: 1,
-        is_initiator,
     };
     println!(
-        "naboscale up: role={} tun={} my_ip={} peer_ip={} via {}",
-        if is_initiator { "initiator" } else { "responder" },
+        "naboscale up: tun={} my_ip={} peers={} bind={}",
         actual_tun_name,
         my_ip,
-        peer_ip,
-        peer_endpoint
+        peer_cfgs.len(),
+        local_endpoint
     );
-    println!("Local endpoint: {}", local_endpoint);
-    let mut manager = TunnelManager::new(Box::new(device), transport, mgr_cfg)?;
+    for (i, pc) in peer_cfgs.iter().enumerate() {
+        println!(
+            "  peer[{}] ip={} endpoint={} role={}",
+            i,
+            pc.peer_ip,
+            pc.peer_endpoint,
+            if pc.is_initiator { "initiator" } else { "responder" }
+        );
+    }
+    let mut manager =
+        TunnelManager::new(Box::new(device), transport, mgr_cfg, peer_cfgs)?;
 
     let _ = client
         .heartbeat(&identity, &state.auth_token, &local_endpoint)
