@@ -15,6 +15,7 @@ pub const MESSAGE_TYPE_INIT: u8 = 0x01;
 pub const MESSAGE_TYPE_RESPONSE: u8 = 0x02;
 pub const MESSAGE_TYPE_COOKIE: u8 = 0x03;
 pub const MESSAGE_TYPE_TRANSPORT: u8 = 0x04;
+pub const MESSAGE_TYPE_RELAY: u8 = 0x05;
 
 const REPLAY_WINDOW_SECONDS: u64 = 120;
 const NOISE_INIT_PAYLOAD_OFFSET: usize = 8;

@@ -14,7 +14,8 @@ pub mod transport;
 pub use error::{Error, Result};
 pub use handshake::{
     Initiator, Responder, COOKIE_SIZE, INIT_SIZE, MESSAGE_TYPE_COOKIE, MESSAGE_TYPE_INIT,
-    MESSAGE_TYPE_RESPONSE, MESSAGE_TYPE_TRANSPORT, RESPONSE_SIZE, TRANSPORT_HEADER_SIZE,
+    MESSAGE_TYPE_RELAY, MESSAGE_TYPE_RESPONSE, MESSAGE_TYPE_TRANSPORT, RESPONSE_SIZE,
+    TRANSPORT_HEADER_SIZE,
 };
 pub use identity::Identity;
 pub use keys::Keypair;

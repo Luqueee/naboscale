@@ -28,12 +28,16 @@ fn make_node(
     local_keypair: Keypair,
     peer_cfgs: Vec<PeerConfig>,
     bind_port: u16,
+    local_ip: Ipv4Addr,
     is_initiator_name: &str,
 ) -> (TunnelManager, LoopbackDevice) {
     let (kernel, user) = LoopbackDevice::new(is_initiator_name);
     let transport =
         UdpTransport::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bind_port)).unwrap();
-    let config = ManagerConfig { local_keypair };
+    let config = ManagerConfig {
+        local_keypair,
+        local_ip,
+    };
     (TunnelManager::new(Box::new(kernel), transport, config, peer_cfgs).unwrap(), user)
 }
 
@@ -51,6 +55,7 @@ fn make_peer_cfg(
         is_initiator,
         peer_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), peer_endpoint_port),
         peer_ip,
+        via_relay: None,
     }
 }
 
@@ -99,8 +104,8 @@ fn two_nodes_complete_handshake_and_tunnel_a_packet() {
         ip_b,
     )];
 
-    let (bob, bob_user) = make_node(bob_kp.clone(), bob_cfgs, port_b, "utun-resp");
-    let (alice, alice_user) = make_node(alice_kp.clone(), alice_cfgs, port_a, "utun-init");
+    let (bob, bob_user) = make_node(bob_kp.clone(), bob_cfgs, port_b, ip_b, "utun-resp");
+    let (alice, alice_user) = make_node(alice_kp.clone(), alice_cfgs, port_a, ip_a, "utun-init");
 
     let (alice_ready_tx, alice_ready_rx) = mpsc::channel();
     let (bob_ready_tx, bob_ready_rx) = mpsc::channel();
@@ -188,9 +193,9 @@ fn three_nodes_complete_handshakes_and_tunnel_packets_to_each_pair() {
         make_peer_cfg(b_pub, 2, false, port_b, ip_b),
     ];
 
-    let (mgr_a, user_a) = make_node(a_kp.clone(), cfgs_a, port_a, "utun-a");
-    let (mgr_b, user_b) = make_node(b_kp.clone(), cfgs_b, port_b, "utun-b");
-    let (mgr_c, user_c) = make_node(c_kp.clone(), cfgs_c, port_c, "utun-c");
+    let (mgr_a, user_a) = make_node(a_kp.clone(), cfgs_a, port_a, ip_a, "utun-a");
+    let (mgr_b, user_b) = make_node(b_kp.clone(), cfgs_b, port_b, ip_b, "utun-b");
+    let (mgr_c, user_c) = make_node(c_kp.clone(), cfgs_c, port_c, ip_c, "utun-c");
 
     let (ra_tx, ra_rx) = mpsc::channel();
     let (rb_tx, rb_rx) = mpsc::channel();
@@ -253,4 +258,156 @@ fn three_nodes_complete_handshakes_and_tunnel_packets_to_each_pair() {
     let _ = ta.join();
     let _ = tb.join();
     let _ = tc.join();
+}
+
+#[test]
+fn three_nodes_with_relay_a_b_traffic_goes_via_r() {
+    // A and B can't reach each other directly; R is a relay with a public IP.
+    // We simulate "unreachable" by simply configuring A and B with via_relay=R
+    // for all transport packets. The handshake still completes directly (so
+    // A and B establish a shared session key), but data is forwarded by R.
+    let a_kp = Keypair::generate();
+    let b_kp = Keypair::generate();
+    let r_kp = Keypair::generate();
+
+    let port_a = free_port();
+    let port_b = free_port();
+    let port_r = free_port();
+
+    let ip_a: Ipv4Addr = "100.100.0.1".parse().unwrap();
+    let ip_b: Ipv4Addr = "100.100.0.2".parse().unwrap();
+    let ip_r: Ipv4Addr = "100.100.0.3".parse().unwrap();
+
+    let a_pub = *a_kp.public();
+    let b_pub = *b_kp.public();
+    let r_pub = *r_kp.public();
+
+    let ep_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+    let ep_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+    let ep_r = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_r);
+
+    let cfgs_a = vec![
+        PeerConfig {
+            peer_pub: b_pub,
+            psk: PSK,
+            local_sender_id: 1,
+            is_initiator: a_pub > b_pub,
+            peer_endpoint: ep_b,
+            peer_ip: ip_b,
+            via_relay: Some(ep_r),
+        },
+        PeerConfig {
+            peer_pub: r_pub,
+            psk: PSK,
+            local_sender_id: 2,
+            is_initiator: a_pub > r_pub,
+            peer_endpoint: ep_r,
+            peer_ip: ip_r,
+            via_relay: None,
+        },
+    ];
+
+    let cfgs_b = vec![
+        PeerConfig {
+            peer_pub: a_pub,
+            psk: PSK,
+            local_sender_id: 1,
+            is_initiator: b_pub > a_pub,
+            peer_endpoint: ep_a,
+            peer_ip: ip_a,
+            via_relay: Some(ep_r),
+        },
+        PeerConfig {
+            peer_pub: r_pub,
+            psk: PSK,
+            local_sender_id: 2,
+            is_initiator: b_pub > r_pub,
+            peer_endpoint: ep_r,
+            peer_ip: ip_r,
+            via_relay: None,
+        },
+    ];
+
+    let cfgs_r = vec![
+        PeerConfig {
+            peer_pub: a_pub,
+            psk: PSK,
+            local_sender_id: 1,
+            is_initiator: r_pub > a_pub,
+            peer_endpoint: ep_a,
+            peer_ip: ip_a,
+            via_relay: None,
+        },
+        PeerConfig {
+            peer_pub: b_pub,
+            psk: PSK,
+            local_sender_id: 2,
+            is_initiator: r_pub > b_pub,
+            peer_endpoint: ep_b,
+            peer_ip: ip_b,
+            via_relay: None,
+        },
+    ];
+
+    let (mgr_a, user_a) = make_node(a_kp.clone(), cfgs_a, port_a, ip_a, "utun-a");
+    let (mgr_b, user_b) = make_node(b_kp.clone(), cfgs_b, port_b, ip_b, "utun-b");
+    let (mgr_r, _user_r) = make_node(r_kp.clone(), cfgs_r, port_r, ip_r, "utun-r");
+
+    let (ra_tx, ra_rx) = mpsc::channel();
+    let (rb_tx, rb_rx) = mpsc::channel();
+    let (rr_tx, rr_rx) = mpsc::channel();
+    let (sa_tx, sa_rx) = mpsc::channel();
+    let (sb_tx, sb_rx) = mpsc::channel();
+    let (sr_tx, sr_rx) = mpsc::channel();
+
+    let ta = std::thread::spawn(move || run_until_stop(mgr_a, ra_tx, sa_rx));
+    let tb = std::thread::spawn(move || run_until_stop(mgr_b, rb_tx, sb_rx));
+    let tr = std::thread::spawn(move || run_until_stop(mgr_r, rr_tx, sr_rx));
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let wait_for = |label: &str, rx: &mpsc::Receiver<()>| {
+        loop {
+            if Instant::now() > deadline {
+                panic!("{label} never became ready");
+            }
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(()) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("{label} thread died"),
+            }
+        }
+    };
+    wait_for("a", &ra_rx);
+    wait_for("b", &rb_rx);
+    wait_for("r", &rr_rx);
+
+    let send_and_recv = |from_user: &LoopbackDevice, to_user: &LoopbackDevice,
+                          from_ip: Ipv4Addr, to_ip: Ipv4Addr, label: &str| {
+        let payload = format!("via relay {label}");
+        let pkt = make_ip_packet(from_ip, to_ip, payload.as_bytes());
+        from_user.send_raw(pkt).expect("send from user");
+        let recv_deadline = Instant::now() + Duration::from_secs(3);
+        let mut received: Option<Vec<u8>> = None;
+        while Instant::now() < recv_deadline {
+            if let Some(p) = to_user.try_recv_raw() {
+                if p.len() >= 20 {
+                    received = Some(p[20..].to_vec());
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let received = received.unwrap_or_else(|| panic!("{label}: packet never arrived"));
+        assert_eq!(received, payload.as_bytes(), "{label}: payload mismatch");
+    };
+
+    send_and_recv(&user_a, &user_b, ip_a, ip_b, "A→B-via-R");
+    send_and_recv(&user_b, &user_a, ip_b, ip_a, "B→A-via-R");
+
+    let _ = sa_tx.send(());
+    let _ = sb_tx.send(());
+    let _ = sr_tx.send(());
+    let _ = ta.join();
+    let _ = tb.join();
+    let _ = tr.join();
 }

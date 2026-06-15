@@ -44,6 +44,8 @@ pub enum Commands {
         tun: String,
         #[arg(long, default_value_t = 51820)]
         bind_port: u16,
+        #[arg(long)]
+        relay: Option<String>,
     },
     Down,
 }
@@ -56,7 +58,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Peers => cmd_peers(&dir).await,
         Commands::Status => cmd_status(&dir),
         Commands::Heartbeat { endpoint } => cmd_heartbeat(&dir, &endpoint).await,
-        Commands::Up { tun, bind_port } => cmd_up(&dir, &tun, bind_port).await,
+        Commands::Up { tun, bind_port, relay } => cmd_up(&dir, &tun, bind_port, relay).await,
         Commands::Down => cmd_down(&dir),
     }
 }
@@ -196,7 +198,7 @@ fn cmd_down(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16) -> Result<()> {
+async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String>) -> Result<()> {
     let identity = identity::load_identity(dir)?;
     let wg = identity::load_wg_key(dir)?;
     let cfg = Config::load(dir)?;
@@ -207,6 +209,14 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16) -> Result<()> {
     if peers.is_empty() {
         return Err(Error::Server("no peers registered on coord server".into()));
     }
+
+    let relay_endpoint: Option<SocketAddr> = match relay.as_deref() {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|_| Error::Server(format!("invalid --relay endpoint: {s}")))?,
+        ),
+        None => None,
+    };
 
     let mut peer_cfgs: Vec<naboscale_tunnel::PeerConfig> = Vec::with_capacity(peers.len());
     for (i, peer) in peers.iter().enumerate() {
@@ -230,6 +240,10 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16) -> Result<()> {
             .parse()
             .map_err(|_| Error::Server(format!("peer ip is not a valid IPv4: {}", peer.ip)))?;
         let is_initiator = *wg.public() > peer_pub;
+        // If a relay is configured, use it for ALL peers. (The relay itself
+        // would have a separate config; for now we assume the relay endpoint
+        // is a known peer too, and the manager will route through it.)
+        let via_relay = relay_endpoint;
         peer_cfgs.push(naboscale_tunnel::PeerConfig {
             peer_pub,
             psk: [0u8; 32],
@@ -237,6 +251,7 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16) -> Result<()> {
             is_initiator,
             peer_endpoint,
             peer_ip,
+            via_relay,
         });
     }
 
@@ -255,6 +270,10 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16) -> Result<()> {
 
     let mgr_cfg = ManagerConfig {
         local_keypair: wg,
+        local_ip: state
+            .ip
+            .parse()
+            .map_err(|_| Error::Server(format!("my own ip is not a valid IPv4: {}", state.ip)))?,
     };
     println!(
         "naboscale up: tun={} my_ip={} peers={} bind={}",

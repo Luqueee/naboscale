@@ -2,14 +2,16 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::transport::UdpTransport;
 use naboscale_crypto::{
-    Initiator, Keypair, MESSAGE_TYPE_INIT, MESSAGE_TYPE_RESPONSE, MESSAGE_TYPE_TRANSPORT, Responder,
-    Tai64N, Transport as CryptoTransport, INIT_SIZE, RESPONSE_SIZE, TRANSPORT_HEADER_SIZE,
+    Initiator, Keypair, MESSAGE_TYPE_INIT, MESSAGE_TYPE_RELAY, MESSAGE_TYPE_RESPONSE,
+    MESSAGE_TYPE_TRANSPORT, Responder, Tai64N, Transport as CryptoTransport, INIT_SIZE,
+    RESPONSE_SIZE, TRANSPORT_HEADER_SIZE,
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 
 pub struct ManagerConfig {
     pub local_keypair: Keypair,
+    pub local_ip: Ipv4Addr,
 }
 
 pub struct PeerConfig {
@@ -19,15 +21,20 @@ pub struct PeerConfig {
     pub is_initiator: bool,
     pub peer_endpoint: SocketAddr,
     pub peer_ip: Ipv4Addr,
+    /// If `Some`, all transport packets to this peer are wrapped in
+    /// `MESSAGE_TYPE_RELAY` and sent to this address. The relay forwards
+    /// the bytes verbatim to `peer_endpoint`; the final destination uses the
+    /// `from_pub` field in the RELAY header to pick the right session.
+    pub via_relay: Option<SocketAddr>,
 }
 
 pub struct TunnelManager {
     device: Box<dyn Device>,
     transport: UdpTransport,
-    #[allow(dead_code)]
     config: ManagerConfig,
     peers: Vec<PeerSession>,
     endpoint_to_peer: HashMap<SocketAddr, usize>,
+    pubkey_to_peer: HashMap<[u8; 32], usize>,
 }
 
 struct PeerSession {
@@ -46,6 +53,8 @@ enum PeerState {
     },
 }
 
+const RELAY_HEADER_SIZE: usize = 1 + 32 + 4; // type + from_pub + dest_ip
+
 impl TunnelManager {
     pub fn new(
         device: Box<dyn Device>,
@@ -55,6 +64,7 @@ impl TunnelManager {
     ) -> Result<Self> {
         let mut peers = Vec::with_capacity(peer_cfgs.len());
         let mut endpoint_to_peer = HashMap::new();
+        let mut pubkey_to_peer = HashMap::new();
         for (i, peer_cfg) in peer_cfgs.into_iter().enumerate() {
             let state = if peer_cfg.is_initiator {
                 let initiator = Initiator::new(
@@ -75,6 +85,7 @@ impl TunnelManager {
                 PeerState::HandshakingAsResponder(responder)
             };
             endpoint_to_peer.insert(peer_cfg.peer_endpoint, i);
+            pubkey_to_peer.insert(peer_cfg.peer_pub, i);
             peers.push(PeerSession {
                 config: peer_cfg,
                 state,
@@ -87,6 +98,7 @@ impl TunnelManager {
             config,
             peers,
             endpoint_to_peer,
+            pubkey_to_peer,
         })
     }
 
@@ -171,16 +183,35 @@ impl TunnelManager {
             Some(i) => i,
             None => return Ok(()),
         };
-        let peer = &mut self.peers[peer_idx];
+        let (peer_ip, peer_endpoint, via_relay) = {
+            let peer = &self.peers[peer_idx];
+            (
+                peer.config.peer_ip,
+                peer.config.peer_endpoint,
+                peer.config.via_relay,
+            )
+        };
+        let from_pub = *self.config.local_keypair.public();
         if let PeerState::Ready {
             transport,
             peer_sender_id,
-        } = &mut peer.state
+        } = &mut self.peers[peer_idx].state
         {
             let mut out = vec![0u8; 1600];
             let ct = transport.encrypt(pkt, *peer_sender_id, &mut out)?;
-            let endpoint = peer.config.peer_endpoint;
-            self.transport.send_to(endpoint, &out[..ct])?;
+            match via_relay {
+                Some(relay) => {
+                    let mut relay_pkt = vec![0u8; RELAY_HEADER_SIZE + ct];
+                    relay_pkt[0] = MESSAGE_TYPE_RELAY;
+                    relay_pkt[1..33].copy_from_slice(&from_pub);
+                    relay_pkt[33..37].copy_from_slice(&peer_ip.octets());
+                    relay_pkt[RELAY_HEADER_SIZE..].copy_from_slice(&out[..ct]);
+                    self.transport.send_to(relay, &relay_pkt)?;
+                }
+                None => {
+                    self.transport.send_to(peer_endpoint, &out[..ct])?;
+                }
+            }
         }
         Ok(())
     }
@@ -206,6 +237,16 @@ impl TunnelManager {
         if pkt.is_empty() {
             return Ok(());
         }
+        if pkt[0] == MESSAGE_TYPE_RELAY {
+            // The source must be a known direct peer (otherwise we'd be an
+            // open relay). The actual sender is inside the RELAY header.
+            if self.endpoint_to_peer.contains_key(&source) {
+                return self.handle_relay(pkt);
+            } else {
+                tracing::debug!(?source, "dropping relay packet from unknown source");
+                return Ok(());
+            }
+        }
         let peer_idx = match self.endpoint_to_peer.get(&source) {
             Some(&i) => i,
             None => {
@@ -223,6 +264,57 @@ impl TunnelManager {
             }
         }
         Ok(())
+    }
+
+    fn handle_relay(&mut self, pkt: &[u8]) -> Result<()> {
+        if pkt.len() < RELAY_HEADER_SIZE {
+            return Err(Error::InvalidConfig("relay packet too short".into()));
+        }
+        let from_pub: [u8; 32] = pkt[1..33].try_into().expect("checked length");
+        let dest_ip = Ipv4Addr::new(pkt[33], pkt[34], pkt[35], pkt[36]);
+        let inner = &pkt[RELAY_HEADER_SIZE..];
+
+        if dest_ip == self.config.local_ip {
+            // We are the final destination. Look up the session by from_pub
+            // (the original sender), not by source endpoint (which is the relay).
+            let peer_idx = self
+                .pubkey_to_peer
+                .get(&from_pub)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidConfig("relay from_pub not a known peer".into())
+                })?;
+            let peer = &mut self.peers[peer_idx];
+            if let PeerState::Ready { transport, .. } = &mut peer.state {
+                if inner.is_empty() || inner[0] != MESSAGE_TYPE_TRANSPORT {
+                    return Err(Error::InvalidConfig(
+                        "relay inner is not a transport packet".into(),
+                    ));
+                }
+                if inner.len() < TRANSPORT_HEADER_SIZE + 16 {
+                    return Err(Error::InvalidConfig(
+                        "relay inner transport packet too short".into(),
+                    ));
+                }
+                let mut out = vec![0u8; 1500];
+                let n = transport.decrypt(inner, &mut out)?;
+                self.device.write(&out[..n])?;
+            }
+            Ok(())
+        } else {
+            // We are an intermediate relay. Forward the entire RELAY packet
+            // (the dest needs the from_pub in the header to decrypt).
+            let endpoint = self
+                .peers
+                .iter()
+                .find(|p| p.config.peer_ip == dest_ip)
+                .map(|p| p.config.peer_endpoint)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!("relay dest {dest_ip} not a known peer").into())
+                })?;
+            self.transport.send_to(endpoint, pkt)?;
+            Ok(())
+        }
     }
 
     fn handle_init(&mut self, peer_idx: usize, pkt: &[u8]) -> Result<()> {
