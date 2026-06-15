@@ -5,6 +5,7 @@ members = [
     "crates/naboscale-proto",
     "crates/naboscale-tunnel",
     "crates/naboscale-coord",
+    "crates/naboscale-cli",
 ]
 
 [workspace.package]
@@ -26,6 +27,7 @@ subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 hex = "0.4"
 naboscale-crypto = { path = "crates/naboscale-crypto" }
+naboscale-tunnel = { path = "crates/naboscale-tunnel" }
 tun = "0.7"
 bytes = "1"
 axum = "0.7"
@@ -37,6 +39,10 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+toml = "0.8"
+naboscale-coord = { path = "crates/naboscale-coord" }
 
 [profile.release]
 lto = "thin"

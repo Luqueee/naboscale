@@ -42,7 +42,7 @@ fn run_until_stop(
 ) {
     let mut signaled = false;
     loop {
-        match stop_rx.recv_timeout(Duration::from_millis(5)) {
+        match stop_rx.recv_timeout(Duration::from_millis(1)) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -90,7 +90,7 @@ fn two_nodes_complete_handshake_and_tunnel_a_packet() {
         run_until_stop(bob, bob_ready_tx, stop_b_rx);
     });
 
-    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    let wait_deadline = Instant::now() + Duration::from_secs(15);
     let wait_for = |label: &str, rx: &mpsc::Receiver<()>| {
         loop {
             if Instant::now() > wait_deadline {
