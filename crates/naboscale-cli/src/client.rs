@@ -26,6 +26,7 @@ pub struct PeerEntry {
     pub wg_pubkey: String,
     pub ip: String,
     pub last_endpoint: Option<String>,
+    pub via_relay: Option<String>,
     pub last_seen: Option<i64>,
 }
 
@@ -104,16 +105,24 @@ impl CoordClient {
         identity: &Identity,
         auth_token: &str,
         endpoint: &str,
+        via_relay: Option<&str>,
     ) -> Result<()> {
         let timestamp = now_unix();
-        let mut msg = Vec::with_capacity(9 + 8 + endpoint.len());
+        let mut msg = Vec::with_capacity(10 + 8 + endpoint.len() + via_relay.map(str::len).unwrap_or(0));
         msg.extend_from_slice(b"heartbeat");
         msg.extend_from_slice(&timestamp.to_be_bytes());
         msg.extend_from_slice(endpoint.as_bytes());
+        if let Some(r) = via_relay {
+            msg.push(0);
+            msg.extend_from_slice(r.as_bytes());
+        } else {
+            msg.push(1);
+        }
         let sig = identity.sign(&msg);
 
         let body = json!({
             "endpoint": endpoint,
+            "via_relay": via_relay,
             "timestamp": timestamp,
             "signature": B64.encode(sig),
         });

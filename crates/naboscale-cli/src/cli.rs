@@ -38,6 +38,8 @@ pub enum Commands {
     Heartbeat {
         #[arg(long)]
         endpoint: String,
+        #[arg(long)]
+        via_relay: Option<String>,
     },
     Up {
         #[arg(long, default_value = "utun99")]
@@ -46,6 +48,12 @@ pub enum Commands {
         bind_port: u16,
         #[arg(long)]
         relay: Option<String>,
+        /// Public endpoint (ip:port) to advertise to coord. Required when behind NAT
+        /// or when binding to 0.0.0.0 (otherwise coord stores 0.0.0.0:port and peers
+        /// cannot reach you). Falls back to env NABOSCALE_ADVERTISE_ENDPOINT, then
+        /// to the bound local socket address.
+        #[arg(long)]
+        advertise_endpoint: Option<String>,
     },
     Down,
 }
@@ -57,8 +65,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Register => cmd_register(&dir).await,
         Commands::Peers => cmd_peers(&dir).await,
         Commands::Status => cmd_status(&dir),
-        Commands::Heartbeat { endpoint } => cmd_heartbeat(&dir, &endpoint).await,
-        Commands::Up { tun, bind_port, relay } => cmd_up(&dir, &tun, bind_port, relay).await,
+        Commands::Heartbeat { endpoint, via_relay } => {
+            cmd_heartbeat(&dir, &endpoint, via_relay.as_deref()).await
+        }
+        Commands::Up { tun, bind_port, relay, advertise_endpoint } => {
+            cmd_up(&dir, &tun, bind_port, relay, advertise_endpoint).await
+        }
         Commands::Down => cmd_down(&dir),
     }
 }
@@ -133,6 +145,7 @@ async fn cmd_peers(dir: &Path) -> Result<()> {
             wg_pubkey_b64: p.wg_pubkey.clone(),
             ip: p.ip.clone(),
             last_endpoint: p.last_endpoint.clone(),
+            via_relay: p.via_relay.clone(),
         })
         .collect();
     updated.save(dir)?;
@@ -167,16 +180,18 @@ fn cmd_status(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_heartbeat(dir: &Path, endpoint: &str) -> Result<()> {
+async fn cmd_heartbeat(dir: &Path, endpoint: &str, via_relay: Option<&str>) -> Result<()> {
     let identity = identity::load_identity(dir)?;
     let cfg = Config::load(dir)?;
     let mut state = State::load(dir)?;
     let client = CoordClient::new(&cfg.server.url);
-    client.heartbeat(&identity, &state.auth_token, endpoint).await?;
+    client
+        .heartbeat(&identity, &state.auth_token, endpoint, via_relay)
+        .await?;
     state.last_endpoint = Some(endpoint.to_string());
     state.last_handshake_at = Some(chrono::Utc::now().timestamp());
     state.save(dir)?;
-    println!("heartbeat sent: {}", endpoint);
+    println!("heartbeat sent: {} (via_relay: {:?})", endpoint, via_relay);
     Ok(())
 }
 
@@ -198,7 +213,13 @@ fn cmd_down(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String>) -> Result<()> {
+async fn cmd_up(
+    dir: &Path,
+    tun_name: &str,
+    bind_port: u16,
+    relay: Option<String>,
+    advertise_endpoint: Option<String>,
+) -> Result<()> {
     let identity = identity::load_identity(dir)?;
     let wg = identity::load_wg_key(dir)?;
     let cfg = Config::load(dir)?;
@@ -207,7 +228,7 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
     let client = CoordClient::new(&cfg.server.url);
     let peers = client.peers(&state.auth_token).await?;
     if peers.is_empty() {
-        return Err(Error::Server("no peers registered on coord server".into()));
+        tracing::warn!("no peers registered on coord server — starting with empty peer set; will discover peers on next up");
     }
 
     let relay_endpoint: Option<SocketAddr> = match relay.as_deref() {
@@ -219,31 +240,87 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
     };
 
     let mut peer_cfgs: Vec<naboscale_tunnel::PeerConfig> = Vec::with_capacity(peers.len());
+    let mut skipped: Vec<&str> = Vec::new();
     for (i, peer) in peers.iter().enumerate() {
         let peer_pub: [u8; 32] = B64
             .decode(&peer.wg_pubkey)?
             .try_into()
             .map_err(|_| Error::Server("peer wg_pubkey is not 32 bytes".into()))?;
-        let peer_endpoint: SocketAddr = peer
-            .last_endpoint
-            .as_deref()
-            .ok_or_else(|| {
-                Error::Server(format!(
-                    "peer {} has no last_endpoint; needs to send a heartbeat",
-                    peer.node_id
-                ))
-            })?
-            .parse()
-            .map_err(|_| Error::Server("peer endpoint is not a valid socket address".into()))?;
+        let peer_endpoint_str = peer.last_endpoint.as_deref();
+        let is_wildcard_endpoint = peer_endpoint_str.is_some_and(|s| {
+            s.starts_with("0.0.0.0:") || s.starts_with("[::]:")
+        });
+        let peer_via_relay: Option<SocketAddr> = match peer.via_relay.as_deref() {
+            Some(s) => match s.parse() {
+                Ok(a) => Some(a),
+                Err(_) => {
+                    return Err(Error::Server(format!(
+                        "peer {} via_relay {s:?} is not a valid ip:port",
+                        peer.node_id
+                    )))
+                }
+            },
+            None => None,
+        };
+        // A peer is usable if it has a real endpoint, OR if it has a via_relay
+        // (we wrap outgoing traffic in RELAY and send to the relay, which then
+        // forwards). Peers with neither (no heartbeat yet) or with a wildcard
+        // endpoint AND no via_relay are unreachable — skip them.
+        if peer_endpoint_str.is_none() {
+            tracing::warn!(
+                node_id = %peer.node_id,
+                ip = %peer.ip,
+                "peer has no last_endpoint yet (no heartbeat); skipping — will be added on next up"
+            );
+            skipped.push(peer.ip.as_str());
+            continue;
+        }
+        if is_wildcard_endpoint && peer_via_relay.is_none() {
+            tracing::warn!(
+                node_id = %peer.node_id,
+                ip = %peer.ip,
+                endpoint = %peer_endpoint_str.unwrap(),
+                "peer advertised a wildcard endpoint (bound to 0.0.0.0 without --advertise-endpoint) and has no via_relay; skipping"
+            );
+            skipped.push(peer.ip.as_str());
+            continue;
+        }
+        // If we have a via_relay for this peer, the peer_endpoint is just a
+        // placeholder (the actual destination is via the relay). Use the
+        // wildcard-parsed address so parsing doesn't fail.
+        let peer_endpoint: SocketAddr = if is_wildcard_endpoint {
+            "0.0.0.0:0".parse().unwrap()
+        } else {
+            peer_endpoint_str
+                .unwrap()
+                .parse()
+                .map_err(|_| Error::Server("peer endpoint is not a valid socket address".into()))?
+        };
         let peer_ip: Ipv4Addr = peer
             .ip
             .parse()
             .map_err(|_| Error::Server(format!("peer ip is not a valid IPv4: {}", peer.ip)))?;
-        let is_initiator = *wg.public() > peer_pub;
-        // If a relay is configured, use it for ALL peers. (The relay itself
-        // would have a separate config; for now we assume the relay endpoint
-        // is a known peer too, and the manager will route through it.)
-        let via_relay = relay_endpoint;
+        // Per-peer via_relay: prefer the value coord reported for this peer
+        // (set by the peer itself when it has --relay). If coord has none, fall
+        // back to the local --relay flag (used when WE are behind a relay and
+        // want all our outgoing traffic to be relayed).
+        let via_relay = peer_via_relay.or(relay_endpoint);
+        // Role override to break deadlocks across relays:
+        //   - if WE have --relay set, we are NAT'd; we always initiate (we
+        //     can send via the relay; our peers may not be able to reach us
+        //     directly).
+        //   - else if the PEER has a via_relay set, the peer is NAT'd; we
+        //     are always responder (the peer initiates and reaches us via
+        //     its relay; our init to the peer's relay address may hairpin
+        //     or otherwise fail).
+        //   - otherwise fall back to pubkey comparison (classic WG-style).
+        let is_initiator = if relay_endpoint.is_some() {
+            true
+        } else if peer_via_relay.is_some() {
+            false
+        } else {
+            *wg.public() > peer_pub
+        };
         peer_cfgs.push(naboscale_tunnel::PeerConfig {
             peer_pub,
             psk: [0u8; 32],
@@ -258,7 +335,10 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
     let device = TunDevice::create(tun_name)?;
     let actual_tun_name = device.name().to_string();
     let my_ip = state.ip.clone();
-    let dummy_peer_ip = peer_cfgs[0].peer_ip.to_string();
+    let dummy_peer_ip = peer_cfgs
+        .first()
+        .map(|p| p.peer_ip.to_string())
+        .unwrap_or_else(|| my_ip.clone());
     platform::configure_tun(&actual_tun_name, &my_ip, &dummy_peer_ip)?;
     platform::add_route("100.100.0.0/16", &actual_tun_name)?;
 
@@ -266,7 +346,29 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
         IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
         bind_port,
     ))?;
-    let local_endpoint = transport.local_addr()?.to_string();
+    let bound_endpoint = transport.local_addr()?.to_string();
+    // Priority: --advertise-endpoint > --relay > env > bound. When behind NAT
+    // and --relay is set, the relay's address is what coord should advertise
+    // (peers reach us through the relay, not via our local bind).
+    let advertised = advertise_endpoint
+        .clone()
+        .or_else(|| relay_endpoint.map(|r| r.to_string()))
+        .or_else(|| std::env::var("NABOSCALE_ADVERTISE_ENDPOINT").ok())
+        .unwrap_or_else(|| bound_endpoint.clone());
+    let via_relay_for_heartbeat = relay_endpoint.map(|r| r.to_string());
+    if advertised.parse::<SocketAddr>().is_err() {
+        return Err(Error::Server(format!(
+            "advertise-endpoint {advertised:?} is not a valid ip:port"
+        )));
+    }
+    if advertised.starts_with("0.0.0.0:") || advertised.starts_with("[::]:") {
+        tracing::warn!(
+            bound = %bound_endpoint,
+            advertised = %advertised,
+            "advertised endpoint is wildcard — peers will not be able to reach you. \
+             pass --advertise-endpoint <public-ip:port> when behind NAT."
+        );
+    }
 
     let mgr_cfg = ManagerConfig {
         local_keypair: wg,
@@ -276,11 +378,12 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
             .map_err(|_| Error::Server(format!("my own ip is not a valid IPv4: {}", state.ip)))?,
     };
     println!(
-        "naboscale up: tun={} my_ip={} peers={} bind={}",
+        "naboscale up: tun={} my_ip={} peers={} bind={} advertise={}",
         actual_tun_name,
         my_ip,
         peer_cfgs.len(),
-        local_endpoint
+        bound_endpoint,
+        advertised,
     );
     for (i, pc) in peer_cfgs.iter().enumerate() {
         println!(
@@ -295,9 +398,14 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
         TunnelManager::new(Box::new(device), transport, mgr_cfg, peer_cfgs)?;
 
     let _ = client
-        .heartbeat(&identity, &state.auth_token, &local_endpoint)
+        .heartbeat(
+            &identity,
+            &state.auth_token,
+            &advertised,
+            via_relay_for_heartbeat.as_deref(),
+        )
         .await;
-    state.last_endpoint = Some(local_endpoint.clone());
+    state.last_endpoint = Some(advertised.clone());
     state.last_handshake_at = Some(Tai64N::now().seconds() as i64);
     state.save(dir)?;
 
@@ -310,13 +418,22 @@ async fn cmd_up(dir: &Path, tun_name: &str, bind_port: u16, relay: Option<String
         let identity = identity.clone();
         let cfg_url = cfg.server.url.clone();
         let auth_token = state.auth_token.clone();
-        let endpoint = local_endpoint.clone();
+        let endpoint = advertised.clone();
+        let via_relay = via_relay_for_heartbeat.clone();
         let dir = dir.to_path_buf();
         tokio::spawn(async move {
             let client = CoordClient::new(&cfg_url);
             loop {
                 tokio::time::sleep(Duration::from_secs(20)).await;
-                if let Err(e) = client.heartbeat(&identity, &auth_token, &endpoint).await {
+                if let Err(e) = client
+                    .heartbeat(
+                        &identity,
+                        &auth_token,
+                        &endpoint,
+                        via_relay.as_deref(),
+                    )
+                    .await
+                {
                     tracing::warn!(?e, "heartbeat failed");
                 }
                 if let Ok(mut s) = State::load(&dir) {

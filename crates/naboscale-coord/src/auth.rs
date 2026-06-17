@@ -33,11 +33,17 @@ pub fn build_register_message(
     msg
 }
 
-pub fn build_heartbeat_message(timestamp: i64, endpoint: &str) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(9 + 8 + endpoint.len());
+pub fn build_heartbeat_message(timestamp: i64, endpoint: &str, via_relay: Option<&str>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(10 + 8 + endpoint.len() + via_relay.map(str::len).unwrap_or(0));
     msg.extend_from_slice(HEARTBEAT_TAG);
     msg.extend_from_slice(&timestamp.to_be_bytes());
     msg.extend_from_slice(endpoint.as_bytes());
+    if let Some(r) = via_relay {
+        msg.push(0);
+        msg.extend_from_slice(r.as_bytes());
+    } else {
+        msg.push(1);
+    }
     msg
 }
 
@@ -57,10 +63,11 @@ pub fn verify_register_signature(
 pub fn verify_heartbeat_signature(
     identity_pubkey: &[u8; 32],
     endpoint: &str,
+    via_relay: Option<&str>,
     timestamp: i64,
     signature: &[u8; 64],
 ) -> Result<()> {
-    let msg = build_heartbeat_message(timestamp, endpoint);
+    let msg = build_heartbeat_message(timestamp, endpoint, via_relay);
     if !Identity::verify(identity_pubkey, &msg, signature) {
         return Err(Error::InvalidSignature);
     }

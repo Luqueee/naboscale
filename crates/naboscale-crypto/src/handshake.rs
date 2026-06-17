@@ -152,6 +152,10 @@ impl Responder {
         self.sender_id
     }
 
+    pub fn set_current_time(&mut self, t: Tai64N) {
+        self.current_time = t;
+    }
+
     pub fn consume_init(&mut self, init_msg: &[u8]) -> Result<[u8; RESPONSE_SIZE]> {
         if init_msg.len() < INIT_SIZE {
             return Err(Error::InvalidLength {

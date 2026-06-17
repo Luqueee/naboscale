@@ -55,6 +55,7 @@ pub async fn register(
         wg_pubkey: wg_pubkey.to_vec(),
         ip: ip.clone(),
         last_endpoint: None,
+        via_relay: None,
         last_seen: None,
         created_at: now,
     };
@@ -74,6 +75,7 @@ pub struct PeerEntry {
     pub wg_pubkey: String,
     pub ip: String,
     pub last_endpoint: Option<String>,
+    pub via_relay: Option<String>,
     pub last_seen: Option<i64>,
 }
 
@@ -97,6 +99,7 @@ pub async fn peers(
                 wg_pubkey: B64.encode(p.wg_pubkey),
                 ip: p.ip,
                 last_endpoint: p.last_endpoint,
+                via_relay: p.via_relay,
                 last_seen: p.last_seen,
             })
             .collect(),
@@ -107,6 +110,7 @@ pub async fn peers(
 #[derive(Deserialize)]
 pub struct HeartbeatRequest {
     pub endpoint: String,
+    pub via_relay: Option<String>,
     pub timestamp: i64,
     pub signature: String,
 }
@@ -125,9 +129,29 @@ pub async fn heartbeat(
 
     let mut identity_pubkey = [0u8; 32];
     identity_pubkey.copy_from_slice(&caller.identity_pubkey);
-    auth::verify_heartbeat_signature(&identity_pubkey, &req.endpoint, req.timestamp, &signature)?;
+    auth::verify_heartbeat_signature(
+        &identity_pubkey,
+        &req.endpoint,
+        req.via_relay.as_deref(),
+        req.timestamp,
+        &signature,
+    )?;
 
-    db::update_endpoint(&state.db, &caller.node_id, &req.endpoint, now)?;
+    // Validate via_relay format if provided (must be ip:port).
+    if let Some(ref r) = req.via_relay {
+        if r.parse::<std::net::SocketAddr>().is_err() {
+            return Err(crate::Error::InvalidRequest(format!(
+                "via_relay {r:?} is not a valid ip:port"
+            )));
+        }
+    }
+    db::update_heartbeat(
+        &state.db,
+        &caller.node_id,
+        &req.endpoint,
+        req.via_relay.as_deref(),
+        now,
+    )?;
     Ok(StatusCode::OK)
 }
 

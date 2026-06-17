@@ -8,6 +8,8 @@ pub struct PeerInfo {
     pub wg_pubkey_b64: String,
     pub ip: String,
     pub last_endpoint: Option<String>,
+    #[serde(default)]
+    pub via_relay: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
