@@ -9,10 +9,7 @@ fn responder_rejects_init_with_timestamp_too_old() {
     let psk = [42u8; 32];
 
     let now = Tai64N::from_unix(2_000_000_000, 0);
-    let stale = Tai64N::from_unix(
-        2_000_000_000 - REPLAY_WINDOW_SECONDS - 1,
-        0,
-    );
+    let stale = Tai64N::from_unix(2_000_000_000 - REPLAY_WINDOW_SECONDS - 1, 0);
 
     let mut alice_hs = Initiator::new(&alice, bob.public(), psk, 1, stale).unwrap();
     let mut bob_hs = Responder::new(&bob, psk, 2, now).unwrap();
@@ -34,10 +31,7 @@ fn responder_rejects_init_with_timestamp_in_future() {
     let psk = [42u8; 32];
 
     let now = Tai64N::from_unix(2_000_000_000, 0);
-    let future = Tai64N::from_unix(
-        2_000_000_000 + REPLAY_WINDOW_SECONDS + 1,
-        0,
-    );
+    let future = Tai64N::from_unix(2_000_000_000 + REPLAY_WINDOW_SECONDS + 1, 0);
 
     let mut alice_hs = Initiator::new(&alice, bob.public(), psk, 1, future).unwrap();
     let mut bob_hs = Responder::new(&bob, psk, 2, now).unwrap();

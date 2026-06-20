@@ -12,13 +12,19 @@ impl Identity {
     pub fn generate() -> Self {
         let signing_key = SigningKey::generate(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
-        Self { signing_key, verifying_key }
+        Self {
+            signing_key,
+            verifying_key,
+        }
     }
 
     pub fn from_bytes(private: [u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(&private);
         let verifying_key = signing_key.verifying_key();
-        Self { signing_key, verifying_key }
+        Self {
+            signing_key,
+            verifying_key,
+        }
     }
 
     pub fn from_public(pubkey: [u8; 32]) -> Option<Self> {
@@ -26,7 +32,10 @@ impl Identity {
             return None;
         };
         let signing_key = SigningKey::from_bytes(&[0u8; 32]);
-        Some(Self { signing_key, verifying_key })
+        Some(Self {
+            signing_key,
+            verifying_key,
+        })
     }
 
     pub fn public(&self) -> [u8; 32] {

@@ -24,11 +24,12 @@ pub fn ensure_config_dir() -> Result<PathBuf> {
 
 pub fn load_identity(dir: &Path) -> Result<Identity> {
     let path = dir.join(IDENTITY_FILE);
-    let bytes = std::fs::read(&path).map_err(|_| {
-        crate::Error::NotInitialized(dir.display().to_string())
-    })?;
+    let bytes = std::fs::read(&path)
+        .map_err(|_| crate::Error::NotInitialized(dir.display().to_string()))?;
     if bytes.len() != 32 {
-        return Err(crate::Error::BadConfig("identity.key has wrong length".into()));
+        return Err(crate::Error::BadConfig(
+            "identity.key has wrong length".into(),
+        ));
     }
     let mut key = [0u8; 32];
     key.copy_from_slice(&bytes);
@@ -43,9 +44,8 @@ pub fn save_identity(dir: &Path, identity: &Identity) -> Result<()> {
 
 pub fn load_wg_key(dir: &Path) -> Result<Keypair> {
     let path = dir.join(WG_KEY_FILE);
-    let bytes = std::fs::read(&path).map_err(|_| {
-        crate::Error::NotInitialized(dir.display().to_string())
-    })?;
+    let bytes = std::fs::read(&path)
+        .map_err(|_| crate::Error::NotInitialized(dir.display().to_string()))?;
     if bytes.len() != 32 {
         return Err(crate::Error::BadConfig("wg.key has wrong length".into()));
     }

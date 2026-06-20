@@ -5,6 +5,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod identity;
+pub mod keystore;
 pub mod platform;
 pub mod state;
 

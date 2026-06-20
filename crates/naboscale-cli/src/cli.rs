@@ -4,6 +4,7 @@ use crate::client::CoordClient;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::identity;
+use crate::keystore::{self, KeyKind, OpenedKeys, PassphraseSource};
 use crate::state::{PeerInfo, State};
 use crate::{platform, NABOSCALE_VERSION};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -19,6 +20,11 @@ use std::time::Duration;
 pub struct Cli {
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
+
+    /// Read the keystore passphrase from a file (first line, trailing newline stripped).
+    /// Falls back to the `NABOSCALE_PASSPHRASE` environment variable.
+    #[arg(long, global = true)]
+    pub passphrase_file: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -41,6 +47,10 @@ pub enum Commands {
         #[arg(long)]
         via_relay: Option<String>,
     },
+    /// Rotate the auth token. The old token is revoked immediately.
+    RefreshToken,
+    /// Self-de-register: delete this node from coord and release its mesh IP.
+    Deregister,
     Up {
         #[arg(long, default_value = "utun99")]
         tun: String,
@@ -60,18 +70,41 @@ pub enum Commands {
 
 pub async fn run(cli: Cli) -> Result<()> {
     let dir = resolve_config_dir(cli.config_dir.as_deref())?;
+    let pp_source = resolve_passphrase_source(cli.passphrase_file.as_deref());
     match cli.command {
-        Commands::Init { server, force } => cmd_init(&dir, &server, force),
-        Commands::Register => cmd_register(&dir).await,
-        Commands::Peers => cmd_peers(&dir).await,
+        Commands::Init { server, force } => cmd_init(&dir, &server, force, &pp_source),
+        Commands::Register => cmd_register(&dir, &pp_source).await,
+        Commands::Peers => cmd_peers(&dir, &pp_source).await,
         Commands::Status => cmd_status(&dir),
-        Commands::Heartbeat { endpoint, via_relay } => {
-            cmd_heartbeat(&dir, &endpoint, via_relay.as_deref()).await
-        }
-        Commands::Up { tun, bind_port, relay, advertise_endpoint } => {
-            cmd_up(&dir, &tun, bind_port, relay, advertise_endpoint).await
-        }
+        Commands::Heartbeat {
+            endpoint,
+            via_relay,
+        } => cmd_heartbeat(&dir, &endpoint, via_relay.as_deref(), &pp_source).await,
+        Commands::RefreshToken => cmd_refresh_token(&dir, &pp_source).await,
+        Commands::Deregister => cmd_deregister(&dir, &pp_source).await,
+        Commands::Up {
+            tun,
+            bind_port,
+            relay,
+            advertise_endpoint,
+        } => cmd_up(&dir, &tun, bind_port, relay, advertise_endpoint, &pp_source).await,
         Commands::Down => cmd_down(&dir),
+    }
+}
+
+fn resolve_passphrase_source(file: Option<&Path>) -> PassphraseSource {
+    match file {
+        Some(p) => match keystore::read_passphrase_file(p) {
+            Ok(b) => PassphraseSource::Bytes(b),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read --passphrase-file {}: {e}",
+                    p.display()
+                );
+                PassphraseSource::Env
+            }
+        },
+        None => PassphraseSource::Env,
     }
 }
 
@@ -90,49 +123,71 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_init(dir: &Path, server: &str, force: bool) -> Result<()> {
+fn cmd_init(dir: &Path, server: &str, force: bool, pp: &PassphraseSource) -> Result<()> {
     ensure_dir(dir)?;
     if identity::identity_exists(dir) && !force {
         return Err(Error::BadConfig(
             "identity already exists; use --force to overwrite".into(),
         ));
     }
+    let passphrase = pp.resolve()?.ok_or_else(|| {
+        Error::BadConfig(format!(
+            "initializing an encrypted keystore requires a passphrase. \
+             set {} or pass --passphrase-file <path>",
+            pp_env(),
+        ))
+    })?;
     let identity = Identity::generate();
     let wg = Keypair::generate();
-    identity::save_identity(dir, &identity)?;
-    identity::save_wg_key(dir, &wg)?;
+    keystore::save_key(
+        dir,
+        KeyKind::Identity,
+        &identity.private_bytes(),
+        &passphrase,
+    )?;
+    keystore::save_key(dir, KeyKind::Wg, &wg.secret_bytes(), &passphrase)?;
     let cfg = Config::default_with_server(server);
     cfg.save(dir)?;
     println!("Initialized in {}", dir.display());
+    println!("  keystore:    encrypted (Argon2id + XChaCha20-Poly1305, chmod 0600)");
     println!("  identity pub: {}", identity.public_base64());
     println!("  wg pub:      {}", B64.encode(wg.public()));
     println!("Next: naboscale register");
     Ok(())
 }
 
-async fn cmd_register(dir: &Path) -> Result<()> {
+fn pp_env() -> &'static str {
+    "NABOSCALE_PASSPHRASE"
+}
+
+async fn cmd_register(dir: &Path, pp: &PassphraseSource) -> Result<()> {
     ensure_dir(dir)?;
-    let identity = identity::load_identity(dir)?;
-    let wg = identity::load_wg_key(dir)?;
+    let passphrase = pp.resolve()?;
+    let ks = OpenedKeys::open(dir, passphrase.as_deref())?;
     let cfg = Config::load(dir)?;
     let client = CoordClient::new(&cfg.server.url);
-    let resp = client.register(&identity, wg.public()).await?;
+    let resp = client.register(&ks.identity, ks.wg.public()).await?;
     let state = State {
         node_id: resp.node_id,
         ip: resp.ip,
         auth_token: resp.auth_token,
+        auth_token_expires_at: Some(resp.auth_token_expires_at),
         last_endpoint: None,
         last_handshake_at: None,
         known_peers: vec![],
     };
     state.save(dir)?;
     println!("Registered. node_id={} ip={}", state.node_id, state.ip);
+    if let Some(exp) = state.auth_token_expires_at {
+        println!("  token expires at: {} (UTC epoch)", exp);
+    }
     println!("Next: naboscale up");
     Ok(())
 }
 
-async fn cmd_peers(dir: &Path) -> Result<()> {
-    let identity = identity::load_identity(dir)?;
+async fn cmd_peers(dir: &Path, pp: &PassphraseSource) -> Result<()> {
+    let passphrase = pp.resolve()?;
+    let ks = OpenedKeys::open(dir, passphrase.as_deref())?;
     let cfg = Config::load(dir)?;
     let state = State::load(dir)?;
     let client = CoordClient::new(&cfg.server.url);
@@ -158,7 +213,7 @@ async fn cmd_peers(dir: &Path) -> Result<()> {
             &p.wg_pubkey_b64[..16]
         );
     }
-    drop(identity);
+    drop(ks);
     Ok(())
 }
 
@@ -171,28 +226,107 @@ fn cmd_status(dir: &Path) -> Result<()> {
     println!("server:     {}", cfg.server.url);
     println!("node_id:    {}", state.node_id);
     println!("ip:         {}", state.ip);
-    println!("endpoint:   {}", state.last_endpoint.as_deref().unwrap_or("(none)"));
+    println!(
+        "endpoint:   {}",
+        state.last_endpoint.as_deref().unwrap_or("(none)")
+    );
     println!("last hs:    {}", state.last_handshake_at.unwrap_or(0));
     println!("peers:      {}", state.known_peers.len());
+    match state.auth_token_expires_at {
+        Some(exp) if exp > chrono::Utc::now().timestamp() => {
+            println!(
+                "token exp:  {} (UTC, {}s remaining)",
+                exp,
+                exp - chrono::Utc::now().timestamp()
+            );
+        }
+        Some(_) => println!("token exp:  EXPIRED — run `naboscale refresh-token`"),
+        None => println!("token exp:  unknown (state pre-expiry tracking)"),
+    }
     for p in &state.known_peers {
-        println!("  {} @ {} ({})", p.ip, p.last_endpoint.as_deref().unwrap_or("?"), p.node_id);
+        println!(
+            "  {} @ {} ({})",
+            p.ip,
+            p.last_endpoint.as_deref().unwrap_or("?"),
+            p.node_id
+        );
     }
     Ok(())
 }
 
-async fn cmd_heartbeat(dir: &Path, endpoint: &str, via_relay: Option<&str>) -> Result<()> {
-    let identity = identity::load_identity(dir)?;
+async fn cmd_heartbeat(
+    dir: &Path,
+    endpoint: &str,
+    via_relay: Option<&str>,
+    pp: &PassphraseSource,
+) -> Result<()> {
+    let passphrase = pp.resolve()?;
+    let ks = OpenedKeys::open(dir, passphrase.as_deref())?;
     let cfg = Config::load(dir)?;
     let mut state = State::load(dir)?;
     let client = CoordClient::new(&cfg.server.url);
+    // If the saved token is past its expiry, refresh transparently before
+    // sending the heartbeat so the call doesn't fail with 401.
+    if is_token_expired(state.auth_token_expires_at) {
+        eprintln!(
+            "token expired at {:?} — refreshing",
+            state.auth_token_expires_at
+        );
+        let refreshed = client
+            .refresh_token(&ks.identity, &state.auth_token)
+            .await?;
+        state.auth_token = refreshed.auth_token;
+        state.auth_token_expires_at = Some(refreshed.auth_token_expires_at);
+    }
     client
-        .heartbeat(&identity, &state.auth_token, endpoint, via_relay)
+        .heartbeat(&ks.identity, &state.auth_token, endpoint, via_relay)
         .await?;
     state.last_endpoint = Some(endpoint.to_string());
     state.last_handshake_at = Some(chrono::Utc::now().timestamp());
     state.save(dir)?;
     println!("heartbeat sent: {} (via_relay: {:?})", endpoint, via_relay);
     Ok(())
+}
+
+async fn cmd_refresh_token(dir: &Path, pp: &PassphraseSource) -> Result<()> {
+    let passphrase = pp.resolve()?;
+    let ks = OpenedKeys::open(dir, passphrase.as_deref())?;
+    let cfg = Config::load(dir)?;
+    let mut state = State::load(dir)?;
+    let client = CoordClient::new(&cfg.server.url);
+    let resp = client
+        .refresh_token(&ks.identity, &state.auth_token)
+        .await?;
+    state.auth_token = resp.auth_token;
+    state.auth_token_expires_at = Some(resp.auth_token_expires_at);
+    state.save(dir)?;
+    println!(
+        "token refreshed; new expiry: {} (UTC epoch)",
+        state.auth_token_expires_at.unwrap_or(0)
+    );
+    Ok(())
+}
+
+async fn cmd_deregister(dir: &Path, pp: &PassphraseSource) -> Result<()> {
+    let passphrase = pp.resolve()?;
+    let ks = OpenedKeys::open(dir, passphrase.as_deref())?;
+    let cfg = Config::load(dir)?;
+    let state = State::load(dir)?;
+    let client = CoordClient::new(&cfg.server.url);
+    client.delete_node(&ks.identity, &state.auth_token).await?;
+    println!(
+        "De-registered node_id={}; mesh IP released back to pool.",
+        state.node_id
+    );
+    Ok(())
+}
+
+/// Returns true if `expires_at` is in the past (or unknown, which we treat
+/// as expired so a stored-but-stale token gets refreshed). Caller is
+/// expected to refresh before the next protected call.
+fn is_token_expired(expires_at: Option<i64>) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    expires_at.is_none_or(|exp| exp <= now)
 }
 
 fn cmd_down(_dir: &Path) -> Result<()> {
@@ -203,8 +337,13 @@ fn cmd_down(_dir: &Path) -> Result<()> {
         return Ok(());
     }
     let text = std::fs::read_to_string(&pid_path)?;
-    let pid: i32 = text.trim().parse().map_err(|_| Error::BadConfig("bad PID file".into()))?;
-    let status = std::process::Command::new("kill").arg(pid.to_string()).status()?;
+    let pid: i32 = text
+        .trim()
+        .parse()
+        .map_err(|_| Error::BadConfig("bad PID file".into()))?;
+    let status = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status()?;
     if !status.success() {
         return Err(Error::Server(format!("kill {pid} failed")));
     }
@@ -219,9 +358,12 @@ async fn cmd_up(
     bind_port: u16,
     relay: Option<String>,
     advertise_endpoint: Option<String>,
+    pp: &PassphraseSource,
 ) -> Result<()> {
-    let identity = identity::load_identity(dir)?;
-    let wg = identity::load_wg_key(dir)?;
+    let passphrase = pp.resolve()?;
+    let ks = OpenedKeys::open(dir, passphrase.as_deref())?;
+    let identity = ks.identity.clone();
+    let wg = ks.wg.clone();
     let cfg = Config::load(dir)?;
     let mut state = State::load(dir)?;
 
@@ -247,9 +389,8 @@ async fn cmd_up(
             .try_into()
             .map_err(|_| Error::Server("peer wg_pubkey is not 32 bytes".into()))?;
         let peer_endpoint_str = peer.last_endpoint.as_deref();
-        let is_wildcard_endpoint = peer_endpoint_str.is_some_and(|s| {
-            s.starts_with("0.0.0.0:") || s.starts_with("[::]:")
-        });
+        let is_wildcard_endpoint =
+            peer_endpoint_str.is_some_and(|s| s.starts_with("0.0.0.0:") || s.starts_with("[::]:"));
         let peer_via_relay: Option<SocketAddr> = match peer.via_relay.as_deref() {
             Some(s) => match s.parse() {
                 Ok(a) => Some(a),
@@ -376,6 +517,7 @@ async fn cmd_up(
             .ip
             .parse()
             .map_err(|_| Error::Server(format!("my own ip is not a valid IPv4: {}", state.ip)))?,
+        ..Default::default()
     };
     println!(
         "naboscale up: tun={} my_ip={} peers={} bind={} advertise={}",
@@ -391,11 +533,14 @@ async fn cmd_up(
             i,
             pc.peer_ip,
             pc.peer_endpoint,
-            if pc.is_initiator { "initiator" } else { "responder" }
+            if pc.is_initiator {
+                "initiator"
+            } else {
+                "responder"
+            }
         );
     }
-    let mut manager =
-        TunnelManager::new(Box::new(device), transport, mgr_cfg, peer_cfgs)?;
+    let mut manager = TunnelManager::new(Box::new(device), transport, mgr_cfg, peer_cfgs)?;
 
     let _ = client
         .heartbeat(
@@ -426,12 +571,7 @@ async fn cmd_up(
             loop {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 if let Err(e) = client
-                    .heartbeat(
-                        &identity,
-                        &auth_token,
-                        &endpoint,
-                        via_relay.as_deref(),
-                    )
+                    .heartbeat(&identity, &auth_token, &endpoint, via_relay.as_deref())
                     .await
                 {
                     tracing::warn!(?e, "heartbeat failed");

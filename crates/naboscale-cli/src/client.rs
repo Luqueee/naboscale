@@ -17,7 +17,16 @@ pub struct RegisterResponse {
     pub node_id: String,
     pub ip: String,
     pub auth_token: String,
+    pub auth_token_expires_at: i64,
     pub derp_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshResponse {
+    pub auth_token: String,
+    pub auth_token_expires_at: i64,
+    #[allow(dead_code)]
+    pub old_token_expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,7 +48,11 @@ impl CoordClient {
     }
 
     pub async fn health(&self) -> Result<String> {
-        let resp = self.http.get(format!("{}/v1/health", self.base_url)).send().await?;
+        let resp = self
+            .http
+            .get(format!("{}/v1/health", self.base_url))
+            .send()
+            .await?;
         let text = resp.text().await?;
         Ok(text)
     }
@@ -108,7 +121,8 @@ impl CoordClient {
         via_relay: Option<&str>,
     ) -> Result<()> {
         let timestamp = now_unix();
-        let mut msg = Vec::with_capacity(10 + 8 + endpoint.len() + via_relay.map(str::len).unwrap_or(0));
+        let mut msg =
+            Vec::with_capacity(10 + 8 + endpoint.len() + via_relay.map(str::len).unwrap_or(0));
         msg.extend_from_slice(b"heartbeat");
         msg.extend_from_slice(&timestamp.to_be_bytes());
         msg.extend_from_slice(endpoint.as_bytes());
@@ -135,7 +149,78 @@ impl CoordClient {
             .send()
             .await?;
         if !resp.status().is_success() {
-            return Err(Error::Server(format!("heartbeat failed: {}", resp.status())));
+            return Err(Error::Server(format!(
+                "heartbeat failed: {}",
+                resp.status()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Exchange a still-valid token for a fresh one. The old token is revoked
+    /// server-side immediately, so this is also how a client rotates a
+    /// leaked credential.
+    pub async fn refresh_token(
+        &self,
+        identity: &Identity,
+        auth_token: &str,
+    ) -> Result<RefreshResponse> {
+        let timestamp = now_unix();
+        let mut msg = Vec::with_capacity(13 + 8);
+        msg.extend_from_slice(b"token_refresh");
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+        let sig = identity.sign(&msg);
+
+        let body = json!({
+            "timestamp": timestamp,
+            "signature": B64.encode(sig),
+        });
+
+        let resp = self
+            .http
+            .post(format!("{}/v1/token/refresh", self.base_url))
+            .bearer_auth(auth_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(json!({}));
+            return Err(Error::Server(format!(
+                "refresh_token failed: {status} {body}"
+            )));
+        }
+        let parsed: RefreshResponse = resp.json().await?;
+        Ok(parsed)
+    }
+
+    /// Self-de-register: delete this node from coord and release its IP.
+    /// After this the saved `auth_token` is useless; the user must
+    /// `init` + `register` again to re-join the mesh.
+    pub async fn delete_node(&self, identity: &Identity, auth_token: &str) -> Result<()> {
+        let timestamp = now_unix();
+        let mut msg = Vec::with_capacity(11 + 8);
+        msg.extend_from_slice(b"delete_node");
+        msg.extend_from_slice(&timestamp.to_be_bytes());
+        let sig = identity.sign(&msg);
+
+        let body = json!({
+            "timestamp": timestamp,
+            "signature": B64.encode(sig),
+        });
+
+        let resp = self
+            .http
+            .delete(format!("{}/v1/node", self.base_url))
+            .bearer_auth(auth_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Server(format!(
+                "delete_node failed: {}",
+                resp.status()
+            )));
         }
         Ok(())
     }

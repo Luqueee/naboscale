@@ -88,7 +88,8 @@ impl Initiator {
         out[4..8].copy_from_slice(&self.sender_id.to_le_bytes());
         let len = self.state.write_message(
             &self.timestamp.to_bytes(),
-            &mut out[NOISE_INIT_PAYLOAD_OFFSET..NOISE_INIT_PAYLOAD_OFFSET + NOISE_INIT_PAYLOAD_SIZE],
+            &mut out
+                [NOISE_INIT_PAYLOAD_OFFSET..NOISE_INIT_PAYLOAD_OFFSET + NOISE_INIT_PAYLOAD_SIZE],
         )?;
         if len != NOISE_INIT_PAYLOAD_SIZE {
             return Err(Error::InvalidLength {
@@ -123,7 +124,8 @@ impl Initiator {
         }
         let mut payload = [0u8; 256];
         self.state.read_message(
-            &response[NOISE_RESPONSE_PAYLOAD_OFFSET..NOISE_RESPONSE_PAYLOAD_OFFSET + NOISE_RESPONSE_PAYLOAD_SIZE],
+            &response[NOISE_RESPONSE_PAYLOAD_OFFSET
+                ..NOISE_RESPONSE_PAYLOAD_OFFSET + NOISE_RESPONSE_PAYLOAD_SIZE],
             &mut payload,
         )?;
         let transport = self.state.into_transport_mode()?;
@@ -145,7 +147,12 @@ impl Responder {
             .build_responder()?;
         let mut local_pub = [0u8; 32];
         local_pub.copy_from_slice(local.public());
-        Ok(Self { state, sender_id, local_pub, current_time })
+        Ok(Self {
+            state,
+            sender_id,
+            local_pub,
+            current_time,
+        })
     }
 
     pub fn sender_id(&self) -> u32 {
@@ -168,7 +175,8 @@ impl Responder {
         }
         let mut payload = [0u8; 256];
         let len = self.state.read_message(
-            &init_msg[NOISE_INIT_PAYLOAD_OFFSET..NOISE_INIT_PAYLOAD_OFFSET + NOISE_INIT_PAYLOAD_SIZE],
+            &init_msg
+                [NOISE_INIT_PAYLOAD_OFFSET..NOISE_INIT_PAYLOAD_OFFSET + NOISE_INIT_PAYLOAD_SIZE],
             &mut payload,
         )?;
         if len != Tai64N::SIZE {
@@ -206,7 +214,8 @@ impl Responder {
         out[8..12].copy_from_slice(&read_u32(&init_msg[4..8]));
         let noise_len = self.state.write_message(
             &[],
-            &mut out[NOISE_RESPONSE_PAYLOAD_OFFSET..NOISE_RESPONSE_PAYLOAD_OFFSET + NOISE_RESPONSE_PAYLOAD_SIZE],
+            &mut out[NOISE_RESPONSE_PAYLOAD_OFFSET
+                ..NOISE_RESPONSE_PAYLOAD_OFFSET + NOISE_RESPONSE_PAYLOAD_SIZE],
         )?;
         if noise_len != NOISE_RESPONSE_PAYLOAD_SIZE {
             return Err(Error::InvalidLength {

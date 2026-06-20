@@ -19,7 +19,9 @@ impl IpAllocator {
         for peer in peers {
             used.insert(ipv4_str_to_u32(&peer.ip));
         }
-        Ok(Self { used: Mutex::new(used) })
+        Ok(Self {
+            used: Mutex::new(used),
+        })
     }
 
     pub fn allocate(&self) -> Result<[u8; 4]> {
@@ -32,6 +34,14 @@ impl IpAllocator {
             }
         }
         Err(Error::IpPoolExhausted)
+    }
+
+    /// Return an IP to the pool after a `DELETE /v1/node`. Idempotent: a
+    /// second call for the same IP is a no-op.
+    pub fn release(&self, ip: &[u8; 4]) {
+        let mut used = self.used.lock().expect("ip allocator poisoned");
+        let n = u32::from_be_bytes(*ip);
+        used.remove(&n);
     }
 }
 

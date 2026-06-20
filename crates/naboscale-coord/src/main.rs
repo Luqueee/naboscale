@@ -12,7 +12,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let db_path = std::env::var("NABOSCALE_COORD_DB").unwrap_or_else(|_| "naboscale-coord.sqlite".into());
+    let db_path =
+        std::env::var("NABOSCALE_COORD_DB").unwrap_or_else(|_| "naboscale-coord.sqlite".into());
     let state = AppState::open(&db_path)?;
 
     let bind: SocketAddr = std::env::var("NABOSCALE_COORD_ADDR")
@@ -23,6 +24,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = naboscale_coord::build_router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "naboscale-coord listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

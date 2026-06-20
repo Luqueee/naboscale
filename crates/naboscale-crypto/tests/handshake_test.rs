@@ -20,12 +20,18 @@ fn noise_ikpsk2_handshake_derives_matching_transport_keys() {
     let mut ciphertext = [0u8; 1024];
     let ct_len = alice_t.encrypt(plaintext, 2, &mut ciphertext).unwrap();
     let mut decrypted = [0u8; 1024];
-    let pt_len = bob_t.decrypt(&ciphertext[..ct_len], &mut decrypted).unwrap();
+    let pt_len = bob_t
+        .decrypt(&ciphertext[..ct_len], &mut decrypted)
+        .unwrap();
     assert_eq!(&decrypted[..pt_len], plaintext);
 
     let mut ciphertext2 = [0u8; 1024];
-    let ct2_len = bob_t.encrypt(b"reply from bob", 1, &mut ciphertext2).unwrap();
+    let ct2_len = bob_t
+        .encrypt(b"reply from bob", 1, &mut ciphertext2)
+        .unwrap();
     let mut decrypted2 = [0u8; 1024];
-    let pt2_len = alice_t.decrypt(&ciphertext2[..ct2_len], &mut decrypted2).unwrap();
+    let pt2_len = alice_t
+        .decrypt(&ciphertext2[..ct2_len], &mut decrypted2)
+        .unwrap();
     assert_eq!(&decrypted2[..pt2_len], b"reply from bob");
 }

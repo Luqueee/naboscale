@@ -3,6 +3,8 @@ use naboscale_crypto::Identity;
 
 pub const REGISTER_TAG: &[u8] = b"register";
 pub const HEARTBEAT_TAG: &[u8] = b"heartbeat";
+pub const REFRESH_TAG: &[u8] = b"token_refresh";
+pub const DELETE_NODE_TAG: &[u8] = b"delete_node";
 pub const TIMESTAMP_WINDOW_SECONDS: i64 = 300;
 
 pub fn current_timestamp() -> i64 {
@@ -34,7 +36,8 @@ pub fn build_register_message(
 }
 
 pub fn build_heartbeat_message(timestamp: i64, endpoint: &str, via_relay: Option<&str>) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(10 + 8 + endpoint.len() + via_relay.map(str::len).unwrap_or(0));
+    let mut msg =
+        Vec::with_capacity(10 + 8 + endpoint.len() + via_relay.map(str::len).unwrap_or(0));
     msg.extend_from_slice(HEARTBEAT_TAG);
     msg.extend_from_slice(&timestamp.to_be_bytes());
     msg.extend_from_slice(endpoint.as_bytes());
@@ -72,4 +75,18 @@ pub fn verify_heartbeat_signature(
         return Err(Error::InvalidSignature);
     }
     Ok(())
+}
+
+pub fn build_refresh_message(timestamp: i64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(REFRESH_TAG.len() + 8);
+    msg.extend_from_slice(REFRESH_TAG);
+    msg.extend_from_slice(&timestamp.to_be_bytes());
+    msg
+}
+
+pub fn build_delete_node_message(timestamp: i64) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(DELETE_NODE_TAG.len() + 8);
+    msg.extend_from_slice(DELETE_NODE_TAG);
+    msg.extend_from_slice(&timestamp.to_be_bytes());
+    msg
 }

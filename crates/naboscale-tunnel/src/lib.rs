@@ -8,5 +8,5 @@ pub mod transport;
 
 pub use device::{Device, LoopbackDevice, TunDevice};
 pub use error::{Error, Result};
-pub use manager::{ManagerConfig, PeerConfig, TunnelManager};
+pub use manager::{ManagerConfig, ManagerTimings, PeerConfig, TunnelManager};
 pub use transport::UdpTransport;

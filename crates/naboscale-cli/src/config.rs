@@ -28,7 +28,9 @@ impl Config {
 
     pub fn default_with_server(url: &str) -> Self {
         Self {
-            server: ServerConfig { url: url.to_string() },
+            server: ServerConfig {
+                url: url.to_string(),
+            },
         }
     }
 }

@@ -27,12 +27,7 @@ impl Transport {
         self.send_counter
     }
 
-    pub fn encrypt(
-        &mut self,
-        plaintext: &[u8],
-        receiver_id: u32,
-        out: &mut [u8],
-    ) -> Result<usize> {
+    pub fn encrypt(&mut self, plaintext: &[u8], receiver_id: u32, out: &mut [u8]) -> Result<usize> {
         if out.len() < TRANSPORT_HEADER_SIZE + plaintext.len() + 16 {
             return Err(Error::BufferTooSmall {
                 needed: TRANSPORT_HEADER_SIZE + plaintext.len() + 16,
@@ -47,7 +42,9 @@ impl Transport {
         out[4..8].copy_from_slice(&receiver_id.to_le_bytes());
         out[8..16].copy_from_slice(&counter.to_le_bytes());
 
-        let len = self.inner.write_message(plaintext, &mut out[TRANSPORT_HEADER_SIZE..])?;
+        let len = self
+            .inner
+            .write_message(plaintext, &mut out[TRANSPORT_HEADER_SIZE..])?;
         Ok(TRANSPORT_HEADER_SIZE + len)
     }
 
@@ -61,10 +58,9 @@ impl Transport {
         if ciphertext[0] != MESSAGE_TYPE_TRANSPORT {
             return Err(Error::InvalidMessageType(ciphertext[0]));
         }
-        let len = self.inner.read_message(
-            &ciphertext[TRANSPORT_HEADER_SIZE..],
-            out,
-        )?;
+        let len = self
+            .inner
+            .read_message(&ciphertext[TRANSPORT_HEADER_SIZE..], out)?;
         Ok(len)
     }
 }

@@ -29,7 +29,10 @@ fn transport_encrypts_with_wireguard_framing() {
 
     let plaintext = b"hello over the wire";
     let mut ciphertext = vec![0u8; 32 + plaintext.len() + 16];
-    let ct_len = pair.alice_t.encrypt(plaintext, bob_sender_id, &mut ciphertext).unwrap();
+    let ct_len = pair
+        .alice_t
+        .encrypt(plaintext, bob_sender_id, &mut ciphertext)
+        .unwrap();
 
     assert_eq!(ciphertext[0], MESSAGE_TYPE_TRANSPORT);
     assert_eq!(&ciphertext[1..4], &[0u8, 0, 0]);
@@ -39,7 +42,10 @@ fn transport_encrypts_with_wireguard_framing() {
     assert_eq!(counter, 0);
 
     let mut decrypted = vec![0u8; plaintext.len() + 16];
-    let pt_len = pair.bob_t.decrypt(&ciphertext[..ct_len], &mut decrypted).unwrap();
+    let pt_len = pair
+        .bob_t
+        .decrypt(&ciphertext[..ct_len], &mut decrypted)
+        .unwrap();
     assert_eq!(&decrypted[..pt_len], plaintext);
 }
 
@@ -51,9 +57,15 @@ fn send_counter_increments_per_packet() {
     let mut out2 = [0u8; 64];
     let mut out3 = [0u8; 64];
 
-    pair.alice_t.encrypt(b"pkt0", bob_sender_id, &mut out1).unwrap();
-    pair.alice_t.encrypt(b"pkt1", bob_sender_id, &mut out2).unwrap();
-    pair.alice_t.encrypt(b"pkt2", bob_sender_id, &mut out3).unwrap();
+    pair.alice_t
+        .encrypt(b"pkt0", bob_sender_id, &mut out1)
+        .unwrap();
+    pair.alice_t
+        .encrypt(b"pkt1", bob_sender_id, &mut out2)
+        .unwrap();
+    pair.alice_t
+        .encrypt(b"pkt2", bob_sender_id, &mut out3)
+        .unwrap();
 
     assert_eq!(u64::from_le_bytes(out1[8..16].try_into().unwrap()), 0);
     assert_eq!(u64::from_le_bytes(out2[8..16].try_into().unwrap()), 1);
@@ -66,8 +78,14 @@ fn bidirectional_transport_round_trip() {
 
     let mut c1 = [0u8; 64];
     let mut c2 = [0u8; 64];
-    let l1 = pair.alice_t.encrypt(b"from alice", bob_sender_id, &mut c1).unwrap();
-    let l2 = pair.bob_t.encrypt(b"from bob", alice_sender_id, &mut c2).unwrap();
+    let l1 = pair
+        .alice_t
+        .encrypt(b"from alice", bob_sender_id, &mut c1)
+        .unwrap();
+    let l2 = pair
+        .bob_t
+        .encrypt(b"from bob", alice_sender_id, &mut c2)
+        .unwrap();
 
     let mut d1 = [0u8; 32];
     let mut d2 = [0u8; 32];

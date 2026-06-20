@@ -8,10 +8,12 @@ pub mod auth;
 pub mod db;
 pub mod error;
 pub mod ip_alloc;
+pub mod rate_limit;
 pub mod routes;
 pub mod server;
 pub mod state;
 
 pub use error::{Error, Result};
+pub use rate_limit::{Bucket, RateLimiter};
 pub use server::build_router;
 pub use state::AppState;

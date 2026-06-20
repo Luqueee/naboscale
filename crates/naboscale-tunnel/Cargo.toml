@@ -15,3 +15,4 @@ tracing = "0.1"
 
 [dev-dependencies]
 naboscale-crypto = { workspace = true }
+tracing-subscriber = { workspace = true }

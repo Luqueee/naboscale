@@ -40,9 +40,9 @@ pub fn configure_tun(name: &str, local_ip: &str, peer_ip: &str) -> Result<()> {
     } else if cfg!(target_os = "linux") {
         configure_tun_linux(name, local_ip)
     } else {
-        Err(Error::Server(format!(
-            "TUN auto-configuration not implemented for this OS"
-        )))
+        Err(Error::Server(
+            "TUN auto-configuration not implemented for this OS".to_string(),
+        ))
     }
 }
 
@@ -78,9 +78,9 @@ pub fn add_route(dest: &str, tun_name: &str) -> Result<()> {
     } else if cfg!(target_os = "linux") {
         add_route_linux(dest, tun_name)
     } else {
-        Err(Error::Server(format!(
-            "route management not implemented for this OS"
-        )))
+        Err(Error::Server(
+            "route management not implemented for this OS".to_string(),
+        ))
     }
 }
 

@@ -17,6 +17,10 @@ pub struct State {
     pub node_id: String,
     pub ip: String,
     pub auth_token: String,
+    /// UTC epoch seconds. `None` for state files written before token
+    /// expiry tracking existed (treated as "unknown" — refresh on next use).
+    #[serde(default)]
+    pub auth_token_expires_at: Option<i64>,
     #[serde(default)]
     pub last_endpoint: Option<String>,
     #[serde(default)]

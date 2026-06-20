@@ -20,6 +20,12 @@ pub enum Error {
     #[error("invalid auth token")]
     InvalidAuthToken,
 
+    #[error("token expired at {0}")]
+    TokenExpired(i64),
+
+    #[error("rate limit exceeded; retry after {0}s")]
+    RateLimited(u64),
+
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 

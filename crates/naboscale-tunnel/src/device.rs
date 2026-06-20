@@ -79,9 +79,7 @@ impl LoopbackDevice {
     }
 
     pub fn send_raw(&self, pkt: Vec<u8>) -> Result<()> {
-        self.to_kernel
-            .send(pkt)
-            .map_err(|_| Error::NotReady)?;
+        self.to_kernel.send(pkt).map_err(|_| Error::NotReady)?;
         Ok(())
     }
 }
