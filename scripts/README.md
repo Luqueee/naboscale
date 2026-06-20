@@ -1,47 +1,54 @@
-# Test scripts
+# Scripts
 
-These scripts run on the **vpn** machine (where the coord server, TUN devices, and root live) — not on a developer laptop. They are kept in git so the test workflow is versioned alongside the code.
+Everything lives here: tests, deploy, systemd units.
+
+## Quick start — deploy to two machines
+
+```bash
+# 1. Tell the script which machines to use
+echo 'HOST_A=10.0.0.1'  > scripts/.deploy.conf
+echo 'HOST_B=10.0.0.2' >> scripts/.deploy.conf
+
+# 2. Run it
+./scripts/deploy-mesh.sh
+
+# Done. Pings A ↔ B through the mesh tunnel.
+```
+
+No flags needed. Reads `scripts/.deploy.conf` (or env vars `DEPLOY_A` / `DEPLOY_B`). See `scripts/.deploy.conf.example`.
+
+Overrides (all optional):
+```bash
+./scripts/deploy-mesh.sh --a 10.0.0.1 --b 10.0.0.2   # explicit hosts
+./scripts/deploy-mesh.sh --no-build                     # skip cargo build
+./scripts/deploy-mesh.sh --keep                         # leave nodes running
+```
+
+Prerequisites on both machines: Linux, systemd, SSH key access, ports 8080/tcp + 51820/udp open.
+
+---
 
 ## Files
 
-- **`test-mesh.sh`** — two-node mesh smoke test. Creates nodes `A` (100.100.0.1) and `B` (100.100.0.2), runs `naboscale up` on both, pings both directions through the TUNs. Fast (~10 s).
-- **`test-all.sh`** — comprehensive 6-section suite (15 tests): build, coord health, CLI workflow, security (bad sig / no token / bad token), persistence, mesh ping. Slow (~2-3 min).
+| File | Purpose |
+|------|---------|
+| `deploy-mesh.sh`           | Zero-config 2-machine deploy + ping test |
+| `.deploy.conf.example`     | Config template for deploy-mesh.sh |
+| `naboscale-coord.service`  | systemd unit for the coord server |
+| `test-mesh.sh`             | Local N-node mesh smoke test |
+| `test-all.sh`              | Full 7-section suite (unit, coord, CLI, errors, persistence, mesh2, mesh3) |
 
-## Layout on the vpn
-
-```
-/root/naboscale/
-├── crates/                # source
-├── target/release/        # built binaries (naboscale, naboscale-coord)
-└── scripts/
-    ├── test-mesh.sh       # ← you are here
-    └── test-all.sh
-```
-
-## Running on the vpn
+## Local tests (single machine)
 
 ```bash
-ssh vpn
-cd /root/naboscale
-export PATH="$HOME/.cargo/bin:$PATH"   # rustup cargo, not apt's
-
-# Mesh only
+# 2-node mesh (~10 s)
 ./scripts/test-mesh.sh
 
-# Full suite
+# Full suite (unit tests + integration + mesh pings, ~2-3 min)
 ./scripts/test-all.sh
 ```
 
-Exit code `0` = all pass, non-zero = at least one failed. The full suite prints a per-section report and a final summary line.
-
-## Syncing the local copy
-
-The canonical source of these scripts is on the vpn. To refresh the local copy after editing on the vpn:
-
-```bash
-scp vpn:/root/naboscale/scripts/test-*.sh /Users/adria/Documents/programacion/projects/naboscale/scripts/
-```
-
-## Editing
-
-Prefer editing on the vpn first, running the suite, then pulling the change to local and committing. Keep both copies identical.
+Environment overrides:
+- `NAB` — path to naboscale binary (default: `target/release/naboscale`)
+- `SERVER` — coord URL (default: `http://127.0.0.1:8080`)
+- `SKIP_BUILD=1` — skip cargo build in test-all

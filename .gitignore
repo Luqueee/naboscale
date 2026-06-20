@@ -43,3 +43,5 @@ core.*
 .agents/
 skills-lock.json
 .opencode/
+
+**/.deploy.conf

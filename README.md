@@ -12,20 +12,46 @@ via a transparent relay path.
 | `naboscale-coord`      | HTTP coordination server (`/v1/register|peers|heartbeat`) |
 | `naboscale-cli`        | `naboscale` binary (`init`, `register`, `up`, ...)  |
 
+## Quick deploy (2 machines, zero-config)
+
+```bash
+# 1. Tell the script which machines to use
+echo 'HOST_A=192.168.1.10' > scripts/.deploy.conf
+echo 'HOST_B=192.168.1.11' >> scripts/.deploy.conf
+
+# 2. Run
+./scripts/deploy-mesh.sh
+```
+
+HOST_A runs the coord server + node 1. HOST_B runs node 2. The script:
+- Cross-compiles for Linux from macOS automatically (`cargo-zigbuild`)
+- Deploys the coord server with a systemd unit
+- Registers both nodes, starts tunnels, shows live progress (TUN up, handshake complete)
+- Pings both directions through the mesh tunnel
+
+If HOST_B is `127.0.0.1`, node 2 runs on the local machine without SSH. Perfect for
+Mac ↔ remote VPN setups. macOS TUN needs sudo — the script asks once at start.
+
+See `scripts/README.md` for all options and `scripts/.deploy.conf.example`.
+
 ## Build
 
 ```sh
 cargo build --release -p naboscale-cli -p naboscale-coord
 ```
 
-Cross-compile for a Linux server from macOS (requires `cargo-zigbuild` + `zig`):
+Cross-compile for a Linux server from macOS (uses `cargo-zigbuild`):
 
 ```sh
-rustup target add aarch64-unknown-linux-gnu
-cargo zigbuild --release -p naboscale-cli --target aarch64-unknown-linux-gnu
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
 ```
 
-## Bring up the mesh
+## CI
+
+GitHub Actions on every push/PR: `cargo fmt --check`, `cargo clippy -- -D warnings`,
+`cargo test`. Config at `.github/workflows/ci.yml`.
+
+## Bring up the mesh (manual)
 
 The mesh requires one coord server plus N node clients. Each node registers
 with the coord, polls the peer list, then opens a UDP tunnel and starts
@@ -42,6 +68,8 @@ Run on a host the clients can reach over HTTP:
 Defaults to `0.0.0.0:8080` and a SQLite DB at `./naboscale-coord.sqlite`
 (override with `NABOSCALE_COORD_ADDR` / `NABOSCALE_COORD_DB`). Health check:
 `GET /v1/health`.
+
+systemd unit included at `scripts/naboscale-coord.service`.
 
 ### 2. Node client
 
@@ -92,15 +120,14 @@ When `--relay` is set:
 - The relay learns the NAT'd node's external `host:port` from the first
   packet and uses that learned address to forward responses back.
 
-### 4. Local 3-node test
+## Features
 
-`scripts/test-mesh.sh` brings up N tunnels on the same machine, registers
-them, pings every pair, and reports. Requires Linux (uses `ip link`).
-
-```sh
-sudo ./scripts/test-mesh.sh 3 51820 99 127.0.0.1 3
-#   ^count ^base-port ^tun-base ^endpoint-host ^stagger-secs
-```
+| Feature | Description |
+|---------|-------------|
+| Cookie DoS protection | Responder sends `MESSAGE_TYPE_COOKIE` when INIT rate >5/s from a peer. Initiator echoes it as mac2 in next INIT. Without valid cookie, INITs are silently dropped — no CPU spent on Noise handshake. Cookie secret rotates every 120s. |
+| Token auto-refresh | Daemon heartbeat loop detects expiring tokens (60s grace) and calls `POST /v1/token/refresh` transparently. Long-running `naboscale up` sessions never lose auth. |
+| Dynamic peer discovery | Every 60s the daemon polls `GET /v1/peers` and adds newly registered nodes to the mesh. No restart needed. |
+| Rate limiting | Coord enforces per-IP buckets: register 5/min, heartbeat 30/min, token refresh 10/min, default 120/min. |
 
 ## Logging
 
@@ -112,12 +139,26 @@ manager emits one `INFO` line per:
 - `learning new endpoint from RELAY source`
 - `forwarding RELAY pkt`
 - `identified INIT initiator via mac1; learning endpoint`
+- `INIT rate limit exceeded; sent COOKIE reply`
+- `cookie mac2 verified; accepting INIT`
 
 Bump to `debug` for noisy packet-level traces:
 
 ```sh
 RUST_LOG=naboscale_tunnel=debug,info naboscale up ...
 ```
+
+## Local tests (single machine)
+
+```bash
+# 2-node mesh (~10 s)
+./scripts/test-mesh.sh
+
+# Full suite (unit + integration + mesh pings, ~2-3 min)
+./scripts/test-all.sh
+```
+
+Environment overrides: `NAB`, `SERVER`, `SKIP_BUILD=1`. See `scripts/README.md`.
 
 ## Caveats
 
@@ -133,3 +174,7 @@ RUST_LOG=naboscale_tunnel=debug,info naboscale up ...
 - TUN setup needs root on macOS and Linux.
 - Empty transport packets (keepalives) are consumed without writing to the
   TUN device — writing zero-length IP packets returns `EINVAL` on Linux.
+- Cookie protection uses a rotating secret (120s). If both the current and
+  previous secret miss (e.g. the initiator's cookie came from a secret that
+  rotated out), a fresh COOKIE is sent on the next INIT retry — at most 2s
+  of added latency.

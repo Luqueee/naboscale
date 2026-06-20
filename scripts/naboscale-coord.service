@@ -1,0 +1,24 @@
+[Unit]
+Description=naboscale coordination server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/naboscale-coord
+Restart=always
+RestartSec=5
+Environment="NABOSCALE_COORD_ADDR=0.0.0.0:8080"
+Environment="NABOSCALE_COORD_DB=/var/lib/naboscale/coord.sqlite"
+Environment="NABOSCALE_COORD_TOKEN_TTL_SECS=2592000"
+LimitNOFILE=65536
+
+# Security hardening
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/naboscale
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

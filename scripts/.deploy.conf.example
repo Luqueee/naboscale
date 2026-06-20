@@ -1,0 +1,17 @@
+# naboscale mesh deploy config
+# Copy to scripts/.deploy.conf and edit:
+#   cp scripts/.deploy.conf.example scripts/.deploy.conf
+
+# Machine A — runs coord server + node 1
+HOST_A=
+
+# Machine B — runs node 2
+HOST_B=
+
+# Optional overrides (uncomment to set):
+# SSH_USER=root
+# COORD_PORT=8080
+# MESH_PORT=51820
+# PASSPHRASE=my-secret-pass
+# BUILD=1
+# KEEP=0
