@@ -1,17 +1,23 @@
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::transport::UdpTransport;
-use naboscale_crypto::mac::{compute_mac1, mac1_key};
+use naboscale_crypto::mac::{compute_mac1, compute_mac2, mac1_key};
 use naboscale_crypto::{
-    Initiator, Keypair, Responder, Tai64N, Transport as CryptoTransport, INIT_SIZE,
-    MESSAGE_TYPE_INIT, MESSAGE_TYPE_RELAY, MESSAGE_TYPE_RESPONSE, MESSAGE_TYPE_TRANSPORT,
-    RESPONSE_SIZE, TRANSPORT_HEADER_SIZE,
+    Initiator, Keypair, Responder, Tai64N, Transport as CryptoTransport, COOKIE_SIZE, INIT_SIZE,
+    INIT_WITH_COOKIE_SIZE, MESSAGE_TYPE_COOKIE, MESSAGE_TYPE_INIT, MESSAGE_TYPE_RELAY,
+    MESSAGE_TYPE_RESPONSE, MESSAGE_TYPE_TRANSPORT, RESPONSE_SIZE, TRANSPORT_HEADER_SIZE,
 };
+use rand::RngCore;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 const INIT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+/// Rotate the cookie secret every 120 s. Previous secret is kept for one
+/// extra rotation window so in-flight cookies don't break.
+const COOKIE_SECRET_ROTATION: Duration = Duration::from_secs(120);
+/// Max INITs from one peer per second before we require a cookie reply.
+const COOKIE_INIT_RATE_LIMIT: u32 = 5;
 
 /// WireGuard-style rekey / keepalive timings. Defaults match the values in the
 /// reference implementation: keepalive every 10 s, rekey every 2 min, mark
@@ -79,6 +85,12 @@ pub struct TunnelManager {
     /// loopback when the peer's stored endpoint equals the relay itself.
     learned_endpoints: HashMap<[u8; 32], SocketAddr>,
     last_maintenance_at: Instant,
+    /// Rotating secret for cookie-based DoS protection. Regenerated every
+    /// COOKIE_SECRET_ROTATION. The previous secret is kept for one extra
+    /// window so in-flight cookies survive a single rotation.
+    cookie_secret: [u8; 32],
+    cookie_secret_rotated_at: Instant,
+    last_cookie_secret: Option<[u8; 32]>,
 }
 
 struct PeerSession {
@@ -98,6 +110,19 @@ struct PeerSession {
     /// True once `now - last_rx_at > reject_after`. While true we drop tunnel
     /// data from this peer (re-handshake is required to recover).
     stale: bool,
+    // ── Cookie DoS protection ──
+    /// INITs received in the current rate-limit window.
+    init_rx_count: u32,
+    init_rx_window_start: Instant,
+    /// True when we sent a COOKIE to this peer. Its next INIT must include a
+    /// valid mac2 or we drop it silently.
+    cookie_required: bool,
+    /// The 16-byte cookie MAC we sent to this peer (proof that we issued a
+    /// cookie). The peer echoes it back as mac2 in its next INIT.
+    sent_cookie: Option<[u8; 16]>,
+    /// Cookie received from this peer (when WE are initiator). Included as
+    /// mac2 in every subsequent INIT we send until the handshake succeeds.
+    received_cookie: Option<[u8; 16]>,
 }
 
 struct Rehandshake {
@@ -130,6 +155,7 @@ enum PeerState {
 const RELAY_HEADER_SIZE: usize = 1 + 32 + 4; // type + from_pub + dest_ip
 const MAC1_OFFSET_INIT: usize = 132;
 const MAC1_LEN: usize = 16;
+const MAC2_OFFSET_INIT: usize = 148; // right after mac1
 
 impl TunnelManager {
     pub fn new(
@@ -176,8 +202,15 @@ impl TunnelManager {
                 last_tx_at: None,
                 last_handshake_at: None,
                 stale: false,
+                init_rx_count: 0,
+                init_rx_window_start: Instant::now(),
+                cookie_required: false,
+                sent_cookie: None,
+                received_cookie: None,
             });
         }
+        let mut cookie_secret = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut cookie_secret);
         Ok(Self {
             device,
             transport,
@@ -187,6 +220,9 @@ impl TunnelManager {
             pubkey_to_peer,
             learned_endpoints: HashMap::new(),
             last_maintenance_at: Instant::now(),
+            cookie_secret,
+            cookie_secret_rotated_at: Instant::now(),
+            last_cookie_secret: None,
         })
     }
 
@@ -196,6 +232,61 @@ impl TunnelManager {
                 .peers
                 .iter()
                 .all(|p| matches!(p.state, PeerState::Ready { .. }))
+    }
+
+    /// Add a peer dynamically (used for late discovery). Returns `true` if
+    /// the peer was actually new (by pubkey), `false` if already known.
+    pub fn add_peer(&mut self, peer_cfg: PeerConfig) -> Result<bool> {
+        if self.pubkey_to_peer.contains_key(&peer_cfg.peer_pub) {
+            return Ok(false);
+        }
+        let i = self.peers.len();
+        let state = if peer_cfg.is_initiator {
+            let initiator = Initiator::new(
+                &self.config.local_keypair,
+                &peer_cfg.peer_pub,
+                peer_cfg.psk,
+                peer_cfg.local_sender_id,
+                Tai64N::now(),
+            )?;
+            PeerState::HandshakingAsInitiator(initiator)
+        } else {
+            let responder = Responder::new(
+                &self.config.local_keypair,
+                peer_cfg.psk,
+                peer_cfg.local_sender_id,
+                Tai64N::now(),
+            )?;
+            PeerState::HandshakingAsResponder(responder)
+        };
+        let next_init_at = if peer_cfg.is_initiator {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        self.endpoint_to_peer.insert(peer_cfg.peer_endpoint, i);
+        self.pubkey_to_peer.insert(peer_cfg.peer_pub, i);
+        self.peers.push(PeerSession {
+            config: peer_cfg,
+            state,
+            next_init_at,
+            cached_init: None,
+            last_rx_at: None,
+            last_tx_at: None,
+            last_handshake_at: None,
+            stale: false,
+            init_rx_count: 0,
+            init_rx_window_start: Instant::now(),
+            cookie_required: false,
+            sent_cookie: None,
+            received_cookie: None,
+        });
+        tracing::info!(
+            peer_ip = ?self.peers[i].config.peer_ip,
+            "dynamically added new peer (total={})",
+            self.peers.len()
+        );
+        Ok(true)
     }
 
     pub fn peer_count(&self) -> usize {
@@ -256,7 +347,18 @@ impl TunnelManager {
                         if peer.cached_init.is_none() {
                             if let PeerState::HandshakingAsInitiator(init) = &mut peer.state {
                                 let init_msg = init.write_init()?;
-                                peer.cached_init = Some(init_msg.to_vec());
+                                // If we received a cookie from this peer,
+                                // extend the INIT with mac2 for DoS protection.
+                                let full_init = if let Some(ref cookie) = peer.received_cookie {
+                                    let mut extended = vec![0u8; INIT_WITH_COOKIE_SIZE];
+                                    extended[..INIT_SIZE].copy_from_slice(&init_msg);
+                                    let mac2 = compute_mac2(cookie, &extended[..MAC2_OFFSET_INIT]);
+                                    extended[MAC2_OFFSET_INIT..].copy_from_slice(&mac2);
+                                    extended
+                                } else {
+                                    init_msg.to_vec()
+                                };
+                                peer.cached_init = Some(full_init);
                             }
                         }
                         (
@@ -327,6 +429,132 @@ impl TunnelManager {
         self.peers
             .iter()
             .any(|p| matches!(p.state, PeerState::Ready { .. }))
+    }
+
+    /// Rate-limit incoming INITs per peer. Returns `Ok(true)` when the INIT
+    /// was handled here (cookie sent or dropped), `Ok(false)` to proceed.
+    fn check_init_cookie(
+        &mut self,
+        peer_idx: usize,
+        source: SocketAddr,
+        pkt: &[u8],
+    ) -> Result<bool> {
+        let now = Instant::now();
+
+        // Phase 1: update rate counter and check cookie state.
+        let (_cookie_required, _sent_cookie, over_limit) = {
+            let peer = &mut self.peers[peer_idx];
+            if now.duration_since(peer.init_rx_window_start) >= Duration::from_secs(1) {
+                peer.init_rx_count = 0;
+                peer.init_rx_window_start = now;
+            }
+            peer.init_rx_count += 1;
+
+            if peer.cookie_required {
+                // Verify mac2 in this INIT.
+                if pkt.len() < INIT_WITH_COOKIE_SIZE {
+                    tracing::debug!(
+                        peer_ip = ?peer.config.peer_ip,
+                        pkt_len = pkt.len(),
+                        "cookie required but INIT too short for mac2; dropping silently"
+                    );
+                    return Ok(true);
+                }
+                let valid = if let Some(ref sent) = peer.sent_cookie {
+                    let expected = compute_mac2(sent, &pkt[..MAC2_OFFSET_INIT]);
+                    expected.as_slice() == &pkt[MAC2_OFFSET_INIT..MAC2_OFFSET_INIT + MAC1_LEN]
+                } else {
+                    tracing::warn!(peer_ip = ?peer.config.peer_ip, "cookie_required but no sent_cookie; allowing");
+                    peer.cookie_required = false;
+                    peer.init_rx_count = 0;
+                    return Ok(false);
+                };
+                if !valid {
+                    tracing::info!(
+                        peer_ip = ?peer.config.peer_ip,
+                        "INIT with invalid mac2 (cookie mismatch); dropping silently"
+                    );
+                    return Ok(true);
+                }
+                tracing::debug!(peer_ip = ?peer.config.peer_ip, "cookie mac2 verified; accepting INIT");
+                peer.cookie_required = false;
+                peer.sent_cookie = None;
+                peer.init_rx_count = 0;
+                return Ok(false);
+            }
+
+            let over = peer.init_rx_count > COOKIE_INIT_RATE_LIMIT;
+            (peer.cookie_required, peer.sent_cookie, over)
+        }; // peer borrow dropped here
+
+        // Phase 2: if rate limit exceeded, generate and send cookie.
+        if over_limit {
+            let cookie = self.generate_cookie(source);
+            self.send_cookie_reply(peer_idx, source, &cookie)?;
+            let peer = &mut self.peers[peer_idx];
+            peer.cookie_required = true;
+            peer.sent_cookie = Some(cookie);
+            tracing::info!(
+                peer_ip = ?peer.config.peer_ip,
+                count = peer.init_rx_count,
+                "INIT rate limit exceeded; sent COOKIE reply"
+            );
+            return Ok(true);
+        }
+
+        Ok(false) // proceed with INIT
+    }
+
+    /// Generate a 16-byte cookie MAC tied to the peer's source address.
+    fn generate_cookie(&self, source: SocketAddr) -> [u8; 16] {
+        let mut key_material = [0u8; 32 + 6];
+        key_material[..32].copy_from_slice(&self.cookie_secret);
+        let ip = match source.ip() {
+            std::net::IpAddr::V4(v4) => v4.octets(),
+            std::net::IpAddr::V6(v6) => v6.octets()[..6].try_into().unwrap(),
+        };
+        key_material[32..].copy_from_slice(&ip[..6.min(ip.len())]);
+        // Use the cookie secret as the key and derive a 16-byte MAC over
+        // the source address. The cookie is opaque to the initiator — it
+        // echos it back verbatim as the mac2 key.
+        compute_mac2(&self.cookie_secret[..16].try_into().unwrap(), &key_material[32..])
+    }
+
+    /// Send a COOKIE reply message to the peer.
+    fn send_cookie_reply(
+        &mut self,
+        peer_idx: usize,
+        source: SocketAddr,
+        cookie: &[u8; 16],
+    ) -> Result<()> {
+        let mut pkt = [0u8; COOKIE_SIZE];
+        pkt[0] = MESSAGE_TYPE_COOKIE;
+        let recv_id = self.peers[peer_idx].config.local_sender_id;
+        pkt[4..8].copy_from_slice(&recv_id.to_le_bytes());
+        pkt[8..24].copy_from_slice(cookie);
+        // bytes 24..64 are zeros (pad)
+        self.transport.send_to(source, &pkt)?;
+        Ok(())
+    }
+
+    /// Handle an incoming COOKIE message from a peer. Store the cookie
+    /// so subsequent INITs we send include a valid mac2.
+    fn handle_cookie(&mut self, peer_idx: usize, pkt: &[u8]) -> Result<()> {
+        if pkt.len() < 24 {
+            return Ok(());
+        }
+        let mut cookie = [0u8; 16];
+        cookie.copy_from_slice(&pkt[8..24]);
+        let peer = &mut self.peers[peer_idx];
+        peer.received_cookie = Some(cookie);
+        // Force a fresh INIT with the cookie included.
+        peer.cached_init = None;
+        peer.next_init_at = Some(Instant::now());
+        tracing::debug!(
+            peer_ip = ?peer.config.peer_ip,
+            "received COOKIE; will include mac2 in next INIT"
+        );
+        Ok(())
     }
 
     fn dispatch_tun_packet(&mut self, pkt: &[u8]) -> Result<()> {
@@ -466,12 +694,12 @@ impl TunnelManager {
                             peer.config.peer_endpoint = source;
                             self.endpoint_to_peer.insert(source, peer_idx);
                         }
-                        // Fall through to normal INIT handling below.
-                        let msg_type = pkt[0];
-                        match msg_type {
-                            MESSAGE_TYPE_INIT => self.handle_init(peer_idx, source, pkt)?,
-                            _ => unreachable!(),
+                        peer.last_rx_at = Some(Instant::now());
+                        // Check cookie DoS rate-limit before processing the INIT.
+                        if self.check_init_cookie(peer_idx, source, pkt)? {
+                            return Ok(());
                         }
+                        self.handle_init(peer_idx, source, pkt)?;
                         return Ok(());
                     }
                 }
@@ -499,9 +727,15 @@ impl TunnelManager {
         }
         let msg_type = pkt[0];
         match msg_type {
-            MESSAGE_TYPE_INIT => self.handle_init(peer_idx, source, pkt)?,
+            MESSAGE_TYPE_INIT => {
+                if self.check_init_cookie(peer_idx, source, pkt)? {
+                    return Ok(());
+                }
+                self.handle_init(peer_idx, source, pkt)?;
+            }
             MESSAGE_TYPE_RESPONSE => self.handle_response(peer_idx, source, pkt)?,
             MESSAGE_TYPE_TRANSPORT => self.handle_transport(peer_idx, pkt)?,
+            MESSAGE_TYPE_COOKIE => self.handle_cookie(peer_idx, pkt)?,
             _ => {
                 tracing::debug!(?msg_type, "ignoring unknown message type");
             }
@@ -898,6 +1132,14 @@ impl TunnelManager {
         }
         self.last_maintenance_at = now;
 
+        // Rotate the cookie secret for DoS protection.
+        if now.duration_since(self.cookie_secret_rotated_at) >= COOKIE_SECRET_ROTATION {
+            self.last_cookie_secret = Some(self.cookie_secret);
+            rand::rngs::OsRng.fill_bytes(&mut self.cookie_secret);
+            self.cookie_secret_rotated_at = now;
+            tracing::debug!("cookie secret rotated");
+        }
+
         enum Action {
             MarkStale,
             SendKeepalive,
@@ -954,6 +1196,7 @@ impl TunnelManager {
                     // and use the SAME instance later when consuming the
                     // RESPONSE — a fresh `Initiator::new` would carry a
                     // different ephemeral key and fail decryption.
+                    let cookie = peer.received_cookie;
                     let res = Initiator::new(
                         &self.config.local_keypair,
                         &peer.config.peer_pub,
@@ -962,7 +1205,15 @@ impl TunnelManager {
                         Tai64N::now(),
                     )
                     .and_then(|mut init| {
-                        let msg = init.write_init()?.to_vec();
+                        let mut msg = init.write_init()?.to_vec();
+                        if let Some(ref cookie) = cookie {
+                            let mut extended = vec![0u8; INIT_WITH_COOKIE_SIZE];
+                            extended[..INIT_SIZE].copy_from_slice(&msg);
+                            let mac2 =
+                                compute_mac2(cookie, &extended[..MAC2_OFFSET_INIT]);
+                            extended[MAC2_OFFSET_INIT..].copy_from_slice(&mac2);
+                            msg = extended;
+                        }
                         Ok((init, msg))
                     });
                     match res {

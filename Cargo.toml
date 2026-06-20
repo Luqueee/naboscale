@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/naboscale-crypto",
-    "crates/naboscale-proto",
     "crates/naboscale-tunnel",
     "crates/naboscale-coord",
     "crates/naboscale-cli",

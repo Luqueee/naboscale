@@ -37,6 +37,17 @@ pub fn compute_mac1(key: &[u8; 32], msg_before_mac: &[u8]) -> [u8; 16] {
     out
 }
 
+/// mac2 is the cookie echo: MAC(cookie, msg). Used for DoS protection.
+pub fn compute_mac2(cookie: &[u8; 16], msg: &[u8]) -> [u8; 16] {
+    let mut mac = <Blake2sMac<U16> as KeyInit>::new_from_slice(cookie)
+        .expect("16-byte cookie fits Blake2sMac<U16> key");
+    Update::update(&mut mac, msg);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&result);
+    out
+}
+
 #[allow(dead_code)]
 pub fn hash_bytes(input: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2s256::new();

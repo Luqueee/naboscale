@@ -11,6 +11,7 @@ description = "TUN device + UDP transport for the naboscale mesh VPN"
 naboscale-crypto = { workspace = true }
 tun = { workspace = true }
 thiserror = { workspace = true }
+rand = { workspace = true }
 tracing = "0.1"
 
 [dev-dependencies]

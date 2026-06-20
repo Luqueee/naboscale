@@ -8,7 +8,6 @@ via a transparent relay path.
 | crate                  | role                                                |
 |------------------------|-----------------------------------------------------|
 | `naboscale-crypto`     | Noise IKpsk2 handshake + transport keys             |
-| `naboscale-proto`      | wire formats                                        |
 | `naboscale-tunnel`     | TUN device + per-peer session manager (UDP)         |
 | `naboscale-coord`      | HTTP coordination server (`/v1/register|peers|heartbeat`) |
 | `naboscale-cli`        | `naboscale` binary (`init`, `register`, `up`, ...)  |

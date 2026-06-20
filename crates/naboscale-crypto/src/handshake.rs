@@ -7,6 +7,8 @@ use snow::params::NoiseParams;
 use snow::HandshakeState;
 
 pub const INIT_SIZE: usize = 148;
+/// INIT extended with a 16-byte mac2 after mac1 (cookie echo).
+pub const INIT_WITH_COOKIE_SIZE: usize = INIT_SIZE + 16;
 pub const RESPONSE_SIZE: usize = 92;
 pub const COOKIE_SIZE: usize = 64;
 pub const TRANSPORT_HEADER_SIZE: usize = 16;

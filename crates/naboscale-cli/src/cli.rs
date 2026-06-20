@@ -329,6 +329,14 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
     expires_at.is_none_or(|exp| exp <= now)
 }
 
+/// Returns true if the token expires within `grace_secs` from now (or is
+/// already expired / unknown). Used by the daemon heartbeat loop to
+/// proactively refresh before the token actually expires.
+fn is_token_expired_soon(expires_at: Option<i64>, grace_secs: i64) -> bool {
+    let now = chrono::Utc::now().timestamp();
+    expires_at.is_none_or(|exp| exp <= now + grace_secs)
+}
+
 fn cmd_down(_dir: &Path) -> Result<()> {
     let _ = identity::ensure_config_dir()?;
     let pid_path = identity::ensure_config_dir()?.join(identity::DAEMON_PID_FILE);
@@ -511,6 +519,7 @@ async fn cmd_up(
         );
     }
 
+    let local_pub = *wg.public();
     let mgr_cfg = ManagerConfig {
         local_keypair: wg,
         local_ip: state
@@ -540,6 +549,10 @@ async fn cmd_up(
             }
         );
     }
+    // Capture known pubkeys before peer_cfgs is moved into TunnelManager.
+    let mut known_pubkeys: std::collections::HashSet<[u8; 32]> =
+        peer_cfgs.iter().map(|pc| pc.peer_pub).collect();
+
     let mut manager = TunnelManager::new(Box::new(device), transport, mgr_cfg, peer_cfgs)?;
 
     let _ = client
@@ -562,7 +575,7 @@ async fn cmd_up(
     let heartbeat_handle = {
         let identity = identity.clone();
         let cfg_url = cfg.server.url.clone();
-        let auth_token = state.auth_token.clone();
+        let mut auth_token = state.auth_token.clone();
         let endpoint = advertised.clone();
         let via_relay = via_relay_for_heartbeat.clone();
         let dir = dir.to_path_buf();
@@ -570,6 +583,27 @@ async fn cmd_up(
             let client = CoordClient::new(&cfg_url);
             loop {
                 tokio::time::sleep(Duration::from_secs(20)).await;
+
+                // Refresh token if expired or expiring within 60 s.
+                if let Ok(s) = State::load(&dir) {
+                    if is_token_expired_soon(s.auth_token_expires_at, 60) {
+                        tracing::info!("auth token expired or expiring; refreshing");
+                        match client.refresh_token(&identity, &auth_token).await {
+                            Ok(resp) => {
+                                auth_token = resp.auth_token;
+                                if let Ok(mut s) = State::load(&dir) {
+                                    s.auth_token = auth_token.clone();
+                                    s.auth_token_expires_at = Some(resp.auth_token_expires_at);
+                                    let _ = s.save(&dir);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(?e, "token refresh failed; heartbeat will likely fail");
+                            }
+                        }
+                    }
+                }
+
                 if let Err(e) = client
                     .heartbeat(&identity, &auth_token, &endpoint, via_relay.as_deref())
                     .await
@@ -585,6 +619,12 @@ async fn cmd_up(
         })
     };
 
+    // Track known pubkeys to detect newly registered peers at runtime.
+    let mut peer_discovery = tokio::time::interval(Duration::from_secs(60));
+    peer_discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let discovery_client = CoordClient::new(&cfg.server.url);
+    let discovery_dir = dir.to_path_buf();
+
     loop {
         tokio::select! {
             _ = &mut stop => {
@@ -595,6 +635,85 @@ async fn cmd_up(
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 if let Err(e) = manager.step() {
                     tracing::warn!(?e, "manager step failed (will retry)");
+                }
+            }
+            _ = peer_discovery.tick() => {
+                // Read the latest token from state (may have been refreshed by
+                // the heartbeat task). If state is unreadable, skip this tick.
+                let token = match State::load(&discovery_dir) {
+                    Ok(s) => s.auth_token,
+                    Err(_) => continue,
+                };
+                match discovery_client.peers(&token).await {
+                    Ok(peers) => {
+                        for peer in &peers {
+                            let Some(peer_pub) = B64.decode(&peer.wg_pubkey).ok()
+                                .and_then(|v| v.try_into().ok())
+                            else { continue };
+                            if known_pubkeys.contains(&peer_pub) {
+                                continue;
+                            }
+                            // Build PeerConfig for the new peer.
+                            let peer_ip: Ipv4Addr = match peer.ip.parse() {
+                                Ok(ip) => ip,
+                                Err(_) => continue,
+                            };
+                            let peer_via_relay: Option<SocketAddr> = peer.via_relay
+                                .as_deref()
+                                .and_then(|s| s.parse().ok());
+                            let peer_endpoint: SocketAddr = match peer.last_endpoint.as_deref() {
+                                Some(s) if !s.starts_with("0.0.0.0:") && !s.starts_with("[::]:") => {
+                                    s.parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                                }
+                                _ => {
+                                    if peer_via_relay.is_some() {
+                                        "0.0.0.0:0".parse().unwrap()
+                                    } else {
+                                        tracing::debug!(
+                                            node_id = %peer.node_id,
+                                            "new peer has no reachable endpoint; skipping"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+                            let via_relay = peer_via_relay.or(relay_endpoint);
+                            let is_initiator = if relay_endpoint.is_some() {
+                                true
+                            } else if peer_via_relay.is_some() {
+                                false
+                            } else {
+                                local_pub > peer_pub
+                            };
+                            let sender_id = (manager.peer_count() as u32) + 1;
+                            let cfg = naboscale_tunnel::PeerConfig {
+                                peer_pub,
+                                psk: [0u8; 32],
+                                local_sender_id: sender_id,
+                                is_initiator,
+                                peer_endpoint,
+                                peer_ip,
+                                via_relay,
+                            };
+                            match manager.add_peer(cfg) {
+                                Ok(true) => {
+                                    known_pubkeys.insert(peer_pub);
+                                    tracing::info!(
+                                        node_id = %peer.node_id,
+                                        ip = %peer.ip,
+                                        "discovered new peer at runtime"
+                                    );
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::warn!(?e, node_id = %peer.node_id, "failed to add discovered peer");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "peer discovery fetch failed");
+                    }
                 }
             }
         }

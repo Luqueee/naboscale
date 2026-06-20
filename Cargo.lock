@@ -1336,18 +1336,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "naboscale-proto"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "naboscale-tunnel"
 version = "0.1.0"
 dependencies = [
  "naboscale-crypto",
+ "rand 0.8.6",
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
